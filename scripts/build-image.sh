@@ -85,7 +85,8 @@ for d in truetype/dejavu truetype/liberation truetype/liberation2 opentype/noto;
 done
 printf 'root:x:0:0::/:/nonexistent\nreed:x:65534:65534::/home/reed:/nonexistent\n' > "$root/etc/passwd"
 printf 'root:x:0:\nreed:x:65534:\n' > "$root/etc/group"
-chown -R 65534:65534 "$root/home/reed"
+# Writable by the browser's user without chown, so it builds rootless too.
+chmod 1777 "$root/home/reed"
 
 # A FROM scratch image has no loader cache: name the library folders.
 libpath=$(cd "$root" && find . -name '*.so*' \( -type f -o -type l \) -not -path './browser/*' -printf '/%h\n' | sed 's#^/\./#/#' | sort -u | paste -sd:)
