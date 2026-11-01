@@ -52,8 +52,14 @@ func testBrowser(t *testing.T) string {
 			browserImage = img
 			return
 		}
-		out, err := exec.Command("bash", "scripts/build-image.sh").Output()
+		var stderr strings.Builder
+		cmd := exec.Command("bash", "scripts/build-image.sh")
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
 		browserImage, browserErr = strings.TrimSpace(string(out)), err
+		if err != nil {
+			browserErr = fmt.Errorf("%v: %s", err, stderr.String())
+		}
 	})
 	if browserErr != nil {
 		t.Fatalf("build-image.sh: %v", browserErr)

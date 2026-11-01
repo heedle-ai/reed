@@ -59,7 +59,8 @@ jobs:
           sudo apt-get install -y socat >/dev/null
           podman --version
           google-chrome --version
-          export REED_IMAGE=$(bash scripts/build-image.sh)
+          REED_IMAGE=$(bash scripts/build-image.sh)   # fails the step if the build fails
+          export REED_IMAGE
           go test -count=1 -v -run 'TestContainer_' . | tee containers.log
           ! grep -q -- '--- SKIP' containers.log
           grep -q -- '--- PASS: TestContainer_OnlyAllowedHostsAreReached' containers.log
