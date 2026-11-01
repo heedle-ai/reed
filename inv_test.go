@@ -306,3 +306,19 @@ func TestInv_BuildImageCopiesOnlyABrowserFolder(t *testing.T) {
 		t.Fatalf("build-image.sh /bin/sh: %v\n%s", err, out)
 	}
 }
+
+// TestInv_BuildImageFollowsChromeWrappers: Google Chrome's launcher is a
+// shell script next to its binary ("exec -a "$0" "$HERE/chrome""), with
+// no absolute exec line; build-image.sh finds the binary beside it.
+// (CI's first run: the script exited silently on GitHub's runner.)
+func TestInv_BuildImageFollowsChromeWrappers(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(dir+"/google-chrome", []byte("#!/bin/bash\nHERE=\"$(dirname \"$(readlink -f \"$0\")\")\"\nexec -a \"$0\" \"$HERE/chrome\" \"$@\"\n"), 0o755)
+	os.WriteFile(dir+"/chrome", []byte("not really an ELF"), 0o755)
+	out, err := exec.Command("bash", "scripts/build-image.sh", dir+"/google-chrome").CombinedOutput()
+	// It must get past the wrapper to the binary beside it, and refuse
+	// that for not being a browser.
+	if err == nil || !strings.Contains(string(out), dir+"/chrome isn't a Chromium binary") {
+		t.Fatalf("%v\n%s", err, out)
+	}
+}

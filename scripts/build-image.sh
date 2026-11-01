@@ -23,8 +23,16 @@ fi
 # google-chrome on PATH is usually a shell wrapper: follow it to the ELF.
 real=$(readlink -f "$bin")
 if head -c 2 "$real" | grep -q '#!'; then
-  # Only an `exec /path/to/browser` line counts.
-  target=$(grep -oE '^[[:space:]]*exec[[:space:]]+"?/[^ "]+' "$real" | grep -oE '/[^ "]+' | tail -1)
+  # A wrapper script: Google Chrome's sits next to its binary ("chrome");
+  # others end with an `exec /path/to/browser` line.
+  here=$(dirname "$real")
+  target=""
+  for c in chrome chromium chrome-headless-shell; do
+    if [ -f "$here/$c" ] && ! head -c 2 "$here/$c" | grep -q '#!'; then target="$here/$c"; break; fi
+  done
+  if [ -z "$target" ]; then
+    target=$(grep -oE '^[[:space:]]*exec[[:space:]]+"?/[^ "]+' "$real" | grep -oE '/[^ "]+' | tail -1 || true)
+  fi
   [ -n "$target" ] || { echo "build-image: can't find the browser $bin runs; pass its path" >&2; exit 1; }
   real=$(readlink -f "$target")
   [ -d "$real" ] && real="$real/chrome"
