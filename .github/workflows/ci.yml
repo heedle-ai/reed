@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]   # Linux amd64, Linux arm64, macOS Apple Silicon
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: reed
+      - uses: actions/checkout@v4      # go.mod replaces the heedle-ai modules with ../
+        with:
+          repository: heedle-ai/weft
+          path: weft
+      - uses: actions/checkout@v4
+        with:
+          repository: heedle-ai/shuttle
+          path: shuttle
+      - uses: actions/checkout@v4
+        with:
+          repository: heedle-ai/draft
+          path: draft
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: reed/go.mod
+          cache-dependency-path: reed/go.sum
+      - name: gofmt
+        working-directory: reed
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: vet
+        working-directory: reed
+        run: go vet ./...
+      - name: test
+        working-directory: reed
+        run: go test -race ./...
+      - name: invariants
+        working-directory: reed
+        run: bash .github/invariants.sh
+      # GitHub's Linux runners have Podman and Google Chrome; macOS runners
+      # have no container engine. Here the browser image is built from the
+      # runner's Chrome, and the container tests must run: skipping fails.
+      - name: containers
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: reed
+        env:
+          REED_REQUIRE_PODMAN: "1"
+        run: |
+          sudo apt-get install -y socat >/dev/null
+          podman --version
+          google-chrome --version
+          export REED_IMAGE=$(bash scripts/build-image.sh)
+          go test -count=1 -v -run 'TestContainer_' . | tee containers.log
+          ! grep -q -- '--- SKIP' containers.log
+          grep -q -- '--- PASS: TestContainer_OnlyAllowedHostsAreReached' containers.log
+          grep -q -- '--- PASS: TestContainer_EveryVisitStartsClean' containers.log
+          grep -q -- '--- PASS: TestContainer_InAProgram' containers.log
+          grep -q -- '--- PASS: TestContainer_DevToolsIsNotExposed' containers.log
+          grep -q -- '--- PASS: TestContainer_OutputsAreBounded' containers.log
+          grep -q -- '--- PASS: TestContainer_ResolvePinsHosts' containers.log
