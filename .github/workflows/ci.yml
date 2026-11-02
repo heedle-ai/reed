@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    # bash -eo pipefail: a failing command in a pipe fails the step
+    # (the default, bash -e, ignores it).
+    shell: bash
+
 jobs:
   test:
     strategy:
@@ -62,7 +68,7 @@ jobs:
           REED_IMAGE=$(bash scripts/build-image.sh)   # fails the step if the build fails
           export REED_IMAGE
           go test -count=1 -v -run 'TestContainer_' . | tee containers.log
-          ! grep -q -- '--- SKIP' containers.log
+          if grep -q -- '--- SKIP' containers.log; then echo 'a test skipped'; exit 1; fi
           grep -q -- '--- PASS: TestContainer_OnlyAllowedHostsAreReached' containers.log
           grep -q -- '--- PASS: TestContainer_EveryVisitStartsClean' containers.log
           grep -q -- '--- PASS: TestContainer_InAProgram' containers.log
