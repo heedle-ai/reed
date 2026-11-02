@@ -3,7 +3,7 @@
 Gives a browsing agent step its own browser: a fresh Chromium in a fresh Podman container. Part of heedle-ai:
 weft (algebra) → draft (language) → shuttle (execution) → bobbin (runtime) →
 warp (object store) → drawdown (UI); reed gives browsing
-agents a browser; loom runs them together.
+agents a browser; pirn gives them Claude; loom runs them together.
 
 ## The first rule: reuse, never rewrite
 

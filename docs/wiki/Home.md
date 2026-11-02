@@ -27,6 +27,7 @@ reed reimplements nothing. Podman isolates the browser, Chromium does the networ
 | [shuttle](https://github.com/heedle-ai/shuttle/wiki) | Durable execution on Temporal |
 | [bobbin](https://github.com/heedle-ai/bobbin/wiki) | A fresh Podman container per agent step |
 | **reed** | A fresh browser per browsing step (this repo) |
+| [pirn](https://github.com/heedle-ai/pirn/wiki) | Claude for agent steps |
 | [warp](https://github.com/heedle-ai/warp/wiki) | Content-addressed store |
 | [drawdown](https://github.com/heedle-ai/drawdown/wiki) | Web UI: one tab per agent, with its live browser |
 | [loom](https://github.com/heedle-ai/loom/wiki) | Runs them together |
