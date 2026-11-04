@@ -1,0 +1,9 @@
+{
+  "name": "reed-browser-agent",
+  "private": true,
+  "description": "Playwright MCP, as reed's browser-agent image runs it (roadmap 9.5). npm ci installs exactly package-lock.json.",
+  "license": "MIT",
+  "dependencies": {
+    "@playwright/mcp": "0.0.84"
+  }
+}

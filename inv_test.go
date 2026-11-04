@@ -131,7 +131,10 @@ func TestInv_NoMounts(t *testing.T) {
 		"--user-data-dir=/tmp/profile", "--crash-dumps-dir=/tmp", "--disable-background-networking",
 		"--disable-component-update", "--disable-sync", "--remote-debugging-port=9222",
 		"--proxy-server=http://127.0.0.1:9", "--proxy-bypass-list=<-loopback>;", "--host-resolver-rules=",
-		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp", "--window-size="} {
+		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp", "--window-size=",
+		// act (roadmap 9.5): Node's -e (the idle container, and writing
+		// Playwright MCP's configuration) and Playwright MCP's own flags.
+		"-e", "--isolated", "--executable-path", "--allowed-origins", "--no-webmcp", "--config", "--output-dir", "--viewport-size"} {
 		allowed[f] = true
 	}
 	fset := token.NewFileSet()
@@ -162,8 +165,9 @@ func TestInv_NoMounts(t *testing.T) {
 	}
 }
 
-// TestInv_OnlyPodmanRunsProcesses: reed's imports are an allowlist, and
-// only reed.go starts a process.
+// TestInv_OnlyPodmanRunsProcesses: reed's imports are an allowlist, only
+// reed.go and act.go start processes, and every process either starts is
+// podman (the browser or session's podman, never another program).
 func TestInv_OnlyPodmanRunsProcesses(t *testing.T) {
 	out, err := exec.Command("go", "list", "-f", `{{join .Imports "\n"}}`, ".").Output()
 	if err != nil {
@@ -172,7 +176,8 @@ func TestInv_OnlyPodmanRunsProcesses(t *testing.T) {
 	for _, p := range strings.Fields(string(out)) {
 		if !strings.Contains(strings.SplitN(p, "/", 2)[0], ".") || strings.HasPrefix(p, "go.temporal.io/sdk/") ||
 			strings.HasPrefix(p, "github.com/chromedp/") || p == "github.com/gobwas/ws" || p == "github.com/heedle-ai/weft" ||
-			p == "github.com/heedle-ai/shuttle" || p == "github.com/heedle-ai/shuttle/plan" || p == "github.com/heedle-ai/draft/registry" {
+			p == "github.com/heedle-ai/shuttle" || p == "github.com/heedle-ai/shuttle/plan" || p == "github.com/heedle-ai/draft/registry" ||
+			p == "golang.org/x/image/draw" { // act's frames (roadmap 9.5)
 			continue
 		}
 		t.Errorf("reed imports %s", p)
@@ -183,8 +188,19 @@ func TestInv_OnlyPodmanRunsProcesses(t *testing.T) {
 	}
 	for _, f := range strings.Fields(string(files)) {
 		src, err := exec.Command("grep", "-l", `"os/exec"`, f).Output()
-		if err == nil && strings.TrimSpace(string(src)) != "" && f != "reed.go" {
-			t.Errorf("%s imports os/exec; only reed.go starts processes", f)
+		if err == nil && strings.TrimSpace(string(src)) != "" && f != "reed.go" && f != "act.go" {
+			t.Errorf("%s imports os/exec; only reed.go and act.go start processes", f)
+		}
+	}
+	// Every process started runs podman: a variable or field holding it
+	// (v[0] is the podman a visit registered), never a literal program.
+	runs := regexp.MustCompile(`exec\.CommandContext\(\w+, ([^,)]+)|exec\.Command\(([^,)]+)`)
+	for _, f := range []string{"reed.go", "act.go"} {
+		b, _ := os.ReadFile(f)
+		for _, m := range runs.FindAllStringSubmatch(string(b), -1) {
+			if prog := m[1] + m[2]; prog != "podman" && prog != "s.podman" && prog != "v[0]" {
+				t.Errorf("%s: a process runs %s, not podman", f, prog)
+			}
 		}
 	}
 }
