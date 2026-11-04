@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -380,6 +381,16 @@ func TestInv_ImageIsTestedBeforeItIsPublished(t *testing.T) {
 	if strings.Contains(s, "podman push") {
 		t.Error("image.yml: images are pushed only with their manifest list (podman manifest push --all)")
 	}
+	// Review 36: nothing may let a step or job be skipped or its failure
+	// ignored, which these string checks alone would not notice.
+	for _, bad := range []string{"continue-on-error", "|| true", "|| :", "if: ", "${{ always", "${{ failure", "if-no-files-found: ignore", "if-no-files-found: warn"} {
+		if strings.Contains(s, bad) {
+			t.Errorf("image.yml uses %q, which could publish an untested image or hide a failure", bad)
+		}
+	}
+	if !strings.Contains(s, "fail-fast: true") || !strings.Contains(s, "if-no-files-found: error") {
+		t.Error("image.yml: both architectures must build, and both archives must exist, or nothing is published")
+	}
 }
 
 // TestInv_ImageBaseIsPinned: every image the workflow names is pinned by
@@ -404,5 +415,85 @@ func TestInv_ImageBaseIsPinned(t *testing.T) {
 		if strings.Contains(string(b), ":latest") {
 			t.Errorf("%s uses :latest", f)
 		}
+	}
+	// Review 36: the container the browser comes from must be the pinned
+	// one, not a name typed beside it.
+	s := string(b)
+	if strings.Count(s, "podman run ") != 1 || !regexp.MustCompile(`-e BUILD_IMAGE_CONTEXT=/context "\$DEBIAN" bash -c`).MatchString(s) {
+		t.Error(`image.yml: the browser must be installed by one podman run of "$DEBIAN", the pinned base`)
+	}
+	if regexp.MustCompile(`debian:[a-z]`).MatchString(strings.ReplaceAll(s, "debian:bookworm-slim's", "")) {
+		t.Error("image.yml names Debian by tag; use $DEBIAN, pinned by digest")
+	}
+}
+
+// TestInv_BuildImageContextMode: with BUILD_IMAGE_CONTEXT set to an empty
+// folder, build-image.sh writes the build context there (the browser's
+// folder under rootfs/ and a Containerfile whose label can't expand
+// anything) and prints the folder, without running podman; it refuses a
+// folder that isn't empty; unset, it still builds with podman. The script
+// is for Linux, so this runs on CI's Linux jobs. (Review 36: the mode had
+// no guard.)
+func TestInv_BuildImageContextMode(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		return // build-image.sh copies a Linux browser and its libraries
+	}
+	dir := t.TempDir()
+	browser, bin := filepath.Join(dir, "browser"), filepath.Join(dir, "bin")
+	os.MkdirAll(browser, 0o755)
+	os.MkdirAll(bin, 0o755)
+	// A static Linux program stands in for Chromium (it only prints a
+	// version) and for socat.
+	src := filepath.Join(dir, "fake.go")
+	os.WriteFile(src, []byte("package main\nimport \"fmt\"\nfunc main() { fmt.Println(`Fake \"Chromium\" 1.0 $HOME`) }\n"), 0o644)
+	build := exec.Command("go", "build", "-o", filepath.Join(browser, "chromium"), src)
+	build.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	os.WriteFile(filepath.Join(browser, "icudtl.dat"), nil, 0o644)
+	os.WriteFile(filepath.Join(browser, "resources.pak"), nil, 0o644)
+	exe, _ := os.ReadFile(filepath.Join(browser, "chromium"))
+	os.WriteFile(filepath.Join(bin, "socat"), exe, 0o755)
+	calls := filepath.Join(dir, "podman-calls")
+	os.WriteFile(filepath.Join(bin, "podman"), []byte("#!/bin/sh\necho \"$*\" >> "+calls+"\necho imageid\n"), 0o755)
+	env := append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx := filepath.Join(dir, "context")
+	os.Mkdir(ctx, 0o755)
+	cmd := exec.Command("bash", "scripts/build-image.sh", filepath.Join(browser, "chromium"))
+	cmd.Env = append(env, "BUILD_IMAGE_CONTEXT="+ctx)
+	out, err := cmd.Output()
+	if err != nil || strings.TrimSpace(string(out)) != ctx {
+		t.Fatalf("context mode: %v, printed %q", err, out)
+	}
+	if _, err := os.Stat(calls); err == nil {
+		b, _ := os.ReadFile(calls)
+		t.Errorf("context mode ran podman: %s", b)
+	}
+	cf, err := os.ReadFile(filepath.Join(ctx, "Containerfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(cf), `LABEL reed.browser="Fake \"Chromium\" 1.0 \$HOME"`) || !strings.Contains(string(cf), `ENTRYPOINT ["/browser/chromium"]`) {
+		t.Errorf("Containerfile:\n%s", cf)
+	}
+	if _, err := os.Stat(filepath.Join(ctx, "rootfs", "browser", "icudtl.dat")); err != nil {
+		t.Errorf("the browser's folder isn't in the context: %v", err)
+	}
+
+	cmd = exec.Command("bash", "scripts/build-image.sh", filepath.Join(browser, "chromium"))
+	cmd.Env = append(env, "BUILD_IMAGE_CONTEXT="+ctx)
+	if b, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(b), "must be an empty folder") {
+		t.Errorf("a folder that isn't empty: %v\n%s", err, b)
+	}
+
+	cmd = exec.Command("bash", "scripts/build-image.sh", filepath.Join(browser, "chromium"))
+	cmd.Env = env
+	if b, err := cmd.Output(); err != nil || strings.TrimSpace(string(b)) != "imageid" {
+		t.Errorf("without BUILD_IMAGE_CONTEXT: %v, printed %q", err, b)
+	}
+	if b, _ := os.ReadFile(calls); !strings.HasPrefix(string(b), "build --quiet -f ") {
+		t.Errorf("without BUILD_IMAGE_CONTEXT, podman ran %q", b)
 	}
 }

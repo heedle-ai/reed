@@ -107,6 +107,7 @@ label=$("$real" --version 2>/dev/null | head -1 || true)
 label=${label:-unknown}
 label=${label//\\/\\\\}
 label=${label//\"/\\\"}
+label=${label//\$/\\\$}
 cat > "$work/Containerfile" <<CF
 FROM scratch
 COPY rootfs/ /
