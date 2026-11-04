@@ -8,6 +8,7 @@ on:
   push:
     branches: [roadmap/9.5-browser-agent]
     paths: ['.github/workflows/spike-9.5.yml', 'testdata/spike/**']
+  # round 2: reed's switches, launch and cdp, with and without Playwright's allowlist
 
 permissions:
   contents: read
@@ -28,30 +29,43 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - name: decoy
+        # A server outside the container that counts every request reaching it.
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/decoy.py" <<'PY'
+          import http.server, sys
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  open(sys.argv[1], "a").write(self.path + "\n"); self.send_response(200); self.end_headers(); self.wfile.write(b"decoy")
+              def log_message(self, *a): pass
+          http.server.ThreadingHTTPServer(("0.0.0.0", 8099), H).serve_forever()
+          PY
+          : > "$RUNNER_TEMP/decoy.log"
+          nohup python3 "$RUNNER_TEMP/decoy.py" "$RUNNER_TEMP/decoy.log" >/dev/null 2>&1 &
+          sleep 1
+          curl -fsS http://127.0.0.1:8099/selftest && : > "$RUNNER_TEMP/decoy.log"
+          echo "DECOY_IP=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')" >> "$GITHUB_ENV"
       - name: drive
         shell: bash
         run: |
-          docker run --rm -v "$PWD/testdata/spike:/spike:ro" -e MCP -e NODE -e NARCH=${{ matrix.narch }} -e ARCH=${{ matrix.arch }} "$DEBIAN" bash -c '
+          docker run --rm -v "$PWD/testdata/spike:/spike:ro" -e MCP -e NODE -e NARCH=${{ matrix.narch }} -e ARCH=${{ matrix.arch }} -e DECOY="http://$DECOY_IP:8099" "$DEBIAN" bash -c '
             set -uo pipefail
-            note() { echo "::notice title=spike-$ARCH $1::$2"; }
+            note() { echo "::notice title=spike2-$ARCH $1::$2"; }
             apt-get update -q >/dev/null
-            apt-get install -y -q --no-install-recommends chromium nodejs npm ca-certificates curl xz-utils fonts-dejavu-core >/dev/null
-            note chromium "$(/usr/lib/chromium/chromium --version 2>&1 | head -1); deb $(dpkg-query -W -f="\${Version}" chromium)"
-            note debian-node "$(node --version)"
-            mkdir -p /work && cd /work
-            npm install --no-save --ignore-scripts "$MCP" @modelcontextprotocol/sdk@1 >/dev/null 2>&1 || note npm "install failed"
-            cp /spike/drive.mjs /work/drive.mjs
-            out=$(timeout 180 node drive.mjs /usr/lib/chromium/chromium /work/node_modules/@playwright/mcp/cli.js 2>&1); rc=$?
-            note "with-debian-node rc=$rc" "$(echo "$out" | grep -E "^(server|form received|server hits|seconds)|Error|error:|requires" | tr "\n" " " | cut -c1-900)"
-            # Node from nodejs.org, checked against its published SHA-256.
+            apt-get install -y -q --no-install-recommends chromium ca-certificates curl xz-utils fonts-dejavu-core >/dev/null
+            note chromium "$(/usr/lib/chromium/chromium --version 2>&1 | head -1)"
+            mkdir -p /opt/spike && cd /opt/spike
             f=node-v$NODE-linux-$NARCH.tar.xz
-            curl -fsSLO https://nodejs.org/dist/v$NODE/$f && curl -fsSL https://nodejs.org/dist/v$NODE/SHASUMS256.txt | grep " $f\$" | sha256sum -c - >/dev/null && tar -xJf $f && export PATH=/work/node-v$NODE-linux-$NARCH/bin:$PATH
-            note node "$(node --version)"
-            out=$(timeout 180 node drive.mjs /usr/lib/chromium/chromium /work/node_modules/@playwright/mcp/cli.js 2>&1); rc=$?
-            note "with-node22 rc=$rc" "$(echo "$out" | grep -E "^(server|form received|server hits|seconds)|Error|error:" | tr "\n" " " | cut -c1-900)"
-            echo "$out" | sed -n "/browser_navigate {\"url\":\"http:\/\/decoy/,+2p" | tr "\n" " " | cut -c1-400 | sed "s/^/::notice title=spike-$ARCH decoy::/"
-            # As the image would run it: not root.
-            useradd -m reed; cp -r /work /home/reed/ && chown -R reed /home/reed/work
-            out=$(su reed -c "cd /home/reed/work && PATH=$PATH timeout 180 node drive.mjs /usr/lib/chromium/chromium /home/reed/work/node_modules/@playwright/mcp/cli.js" 2>&1); rc=$?
-            note "not-root rc=$rc" "$(echo "$out" | grep -E "^(form received|server hits|seconds)|Error|error:" | tr "\n" " " | cut -c1-600)"
+            curl -fsSLO https://nodejs.org/dist/v$NODE/$f && curl -fsSL https://nodejs.org/dist/v$NODE/SHASUMS256.txt | grep " $f\$" | sha256sum -c - >/dev/null && tar -xJf $f && rm $f
+            export PATH=/opt/spike/node-v$NODE-linux-$NARCH/bin:$PATH
+            npm install --no-save --ignore-scripts "$MCP" @modelcontextprotocol/sdk@1 >/dev/null 2>&1 || note npm "install failed"
+            cp /spike/drive2.mjs /opt/spike/
+            useradd -m reed; chmod -R a+rX /opt/spike
+            for mode in launch cdp; do for allow in yes no; do
+              out=$(su reed -s /bin/bash -c "cd /opt/spike && PATH=$PATH timeout 180 node drive2.mjs $mode /usr/lib/chromium/chromium /opt/spike/node_modules/@playwright/mcp/cli.js $allow $DECOY" 2>&1)
+              r=$(echo "$out" | grep "^RESULT " | tail -1)
+              note "$mode allow=$allow" "${r:-no result: $(echo "$out" | tail -5 | tr "\n" " " | cut -c1-600)}"
+            done; done
           '
+          echo "::notice title=spike2-${{ matrix.arch }} decoy hits::$(wc -l < "$RUNNER_TEMP/decoy.log") $(head -5 "$RUNNER_TEMP/decoy.log" | tr '\n' ' ')"
