@@ -36,7 +36,7 @@ const origin = `http://${ip}:8080`;
 const reedFlags = ["--no-sandbox", "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check",
   "--disable-background-networking", "--disable-component-update", "--disable-sync",
   "--proxy-server=http://127.0.0.1:9", `--proxy-bypass-list=<-loopback>;${ip}`,
-  "--host-resolver-rules=MAP * ~NOTFOUND", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"];
+  `--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE ${ip}`, "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"];
 let chromium, args = [cli, "--no-webmcp", "--image-responses", "omit", "--output-dir", "/tmp/pwout"];
 if (pwAllow === "yes") args.push("--allowed-origins", origin);
 if (mode === "cdp") {

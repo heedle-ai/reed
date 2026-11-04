@@ -8,7 +8,7 @@ on:
   push:
     branches: [roadmap/9.5-browser-agent]
     paths: ['.github/workflows/spike-9.5.yml', 'testdata/spike/**']
-  # round 2: reed's switches, launch and cdp, with and without Playwright's allowlist
+  # round 3: reed's host resolver rules exclude the allowed address, as ChromiumFlags does
 
 permissions:
   contents: read
