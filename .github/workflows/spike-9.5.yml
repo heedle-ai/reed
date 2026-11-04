@@ -1,0 +1,57 @@
+name: Spike 9.5
+
+# Temporary (roadmap 9.5): runs Playwright MCP against Debian bookworm's
+# Chromium, in the Debian container image.yml pins, and drives a two-page
+# local form over stdio. Results are annotations. Removed once reported.
+
+on:
+  push:
+    branches: [roadmap/9.5-browser-agent]
+    paths: ['.github/workflows/spike-9.5.yml', 'testdata/spike/**']
+
+permissions:
+  contents: read
+
+env:
+  DEBIAN: docker.io/library/debian@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+  MCP: "@playwright/mcp@0.0.84"
+  NODE: "22.21.1"
+
+jobs:
+  spike:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: amd64, narch: x64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64, narch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: drive
+        shell: bash
+        run: |
+          docker run --rm -v "$PWD/testdata/spike:/spike:ro" -e MCP -e NODE -e NARCH=${{ matrix.narch }} -e ARCH=${{ matrix.arch }} "$DEBIAN" bash -c '
+            set -uo pipefail
+            note() { echo "::notice title=spike-$ARCH $1::$2"; }
+            apt-get update -q >/dev/null
+            apt-get install -y -q --no-install-recommends chromium nodejs npm ca-certificates curl xz-utils fonts-dejavu-core >/dev/null
+            note chromium "$(/usr/lib/chromium/chromium --version 2>&1 | head -1); deb $(dpkg-query -W -f="\${Version}" chromium)"
+            note debian-node "$(node --version)"
+            mkdir -p /work && cd /work
+            npm install --no-save --ignore-scripts "$MCP" @modelcontextprotocol/sdk@1 >/dev/null 2>&1 || note npm "install failed"
+            cp /spike/drive.mjs /work/drive.mjs
+            out=$(timeout 180 node drive.mjs /usr/lib/chromium/chromium /work/node_modules/@playwright/mcp/cli.js 2>&1); rc=$?
+            note "with-debian-node rc=$rc" "$(echo "$out" | grep -E "^(server|form received|server hits|seconds)|Error|error:|requires" | tr "\n" " " | cut -c1-900)"
+            # Node from nodejs.org, checked against its published SHA-256.
+            f=node-v$NODE-linux-$NARCH.tar.xz
+            curl -fsSLO https://nodejs.org/dist/v$NODE/$f && curl -fsSL https://nodejs.org/dist/v$NODE/SHASUMS256.txt | grep " $f\$" | sha256sum -c - >/dev/null && tar -xJf $f && export PATH=/work/node-v$NODE-linux-$NARCH/bin:$PATH
+            note node "$(node --version)"
+            out=$(timeout 180 node drive.mjs /usr/lib/chromium/chromium /work/node_modules/@playwright/mcp/cli.js 2>&1); rc=$?
+            note "with-node22 rc=$rc" "$(echo "$out" | grep -E "^(server|form received|server hits|seconds)|Error|error:" | tr "\n" " " | cut -c1-900)"
+            echo "$out" | sed -n "/browser_navigate {\"url\":\"http:\/\/decoy/,+2p" | tr "\n" " " | cut -c1-400 | sed "s/^/::notice title=spike-$ARCH decoy::/"
+            # As the image would run it: not root.
+            useradd -m reed; cp -r /work /home/reed/ && chown -R reed /home/reed/work
+            out=$(su reed -c "cd /home/reed/work && PATH=$PATH timeout 180 node drive.mjs /usr/lib/chromium/chromium /home/reed/work/node_modules/@playwright/mcp/cli.js" 2>&1); rc=$?
+            note "not-root rc=$rc" "$(echo "$out" | grep -E "^(form received|server hits|seconds)|Error|error:" | tr "\n" " " | cut -c1-600)"
+          '
