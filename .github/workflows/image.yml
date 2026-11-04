@@ -78,7 +78,7 @@ jobs:
               apt-get update -q >/dev/null
               apt-get install -y -q --no-install-recommends chromium socat file fontconfig fonts-dejavu-core fonts-liberation >/dev/null
               bash /scripts/build-image.sh /usr/lib/chromium/chromium'
-          id=$(podman build --quiet -f "$ctx/Containerfile" "$ctx" | tail -1)
+          id=$(podman build --quiet --label org.opencontainers.image.source=https://github.com/heedle-ai/reed -f "$ctx/Containerfile" "$ctx" | tail -1)
           arch=$(podman image inspect --format '{{.Architecture}}' "$id")
           if [ "$arch" != "${{ matrix.arch }}" ]; then echo "built $arch, want ${{ matrix.arch }}"; exit 1; fi
           podman image inspect --format '{{index .Labels "reed.browser"}}' "$id"
