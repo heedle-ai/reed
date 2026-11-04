@@ -44,4 +44,4 @@ reed reimplements nothing. Podman isolates the browser, Chromium does the networ
 - Go **1.24** or later
 - **Podman 4.9** or later, and **socat**, on Linux (amd64 or arm64)
 - A Chromium on that machine to build the image from: Google Chrome, Chromium, or Chrome's headless shell
-- macOS on Apple Silicon: Podman runs containers in its Linux VM, so the image must be built inside Linux. **Planned:** a tested recipe for building the image on a Mac.
+- macOS on Apple Silicon: Podman runs containers in its Linux VM, so the image must be Linux arm64. The published image is built for it ([Getting Started → The published image](Getting-Started#5-the-published-image)), and `heedle up` downloads it.

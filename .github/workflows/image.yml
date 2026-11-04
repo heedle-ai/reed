@@ -1,0 +1,137 @@
+name: Image
+
+# Builds the published browser image, ghcr.io/heedle-ai/reed-browser, for
+# linux/amd64 and linux/arm64, tests each with reed's container tests, and
+# only then pushes both by digest with a manifest list over them. heedle
+# pins the manifest list's digest; the tag pushed with it is a label for
+# people, never what anything pulls.
+#
+# Chrome for Testing has no Linux arm64 build, so the browser is Debian
+# bookworm's chromium package, which has both. It is installed in a Debian
+# container pinned by digest, and scripts/build-image.sh assembles the image
+# there (BUILD_IMAGE_CONTEXT): the browser's folder, the Debian libraries it
+# links, fonts and socat. The image itself is built outside, with Podman.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['image-v*']
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # bash -eo pipefail: a failing command in a pipe fails the step.
+    shell: bash
+
+env:
+  # debian:bookworm-slim's multi-platform index, as docker-library/repo-info
+  # recorded it on 2026-11-04. A new base is a new digest here.
+  DEBIAN: docker.io/library/debian@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-24.04       # linux/amd64
+            arch: amd64
+          - runner: ubuntu-24.04-arm   # linux/arm64, what a Mac's Podman machine runs
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: reed
+      - uses: actions/checkout@v4      # go.mod replaces the heedle-ai modules with ../
+        with:
+          repository: heedle-ai/weft
+          path: weft
+      - uses: actions/checkout@v4
+        with:
+          repository: heedle-ai/shuttle
+          path: shuttle
+      - uses: actions/checkout@v4
+        with:
+          repository: heedle-ai/draft
+          path: draft
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: reed/go.mod
+          cache-dependency-path: reed/go.sum
+      - name: podman
+        run: |
+          if command -v podman >/dev/null; then podman --version; exit 0; fi
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y podman >/dev/null
+          podman --version
+      - name: build
+        working-directory: reed
+        run: |
+          ctx="$RUNNER_TEMP/context"
+          mkdir -p "$ctx"
+          podman run --rm -v "$PWD/scripts:/scripts:ro" -v "$ctx:/context" \
+            -e BUILD_IMAGE_CONTEXT=/context "$DEBIAN" bash -c '
+              set -euo pipefail
+              apt-get update -q >/dev/null
+              apt-get install -y -q --no-install-recommends chromium socat file fontconfig fonts-dejavu-core fonts-liberation >/dev/null
+              bash /scripts/build-image.sh /usr/lib/chromium/chromium'
+          id=$(podman build --quiet -f "$ctx/Containerfile" "$ctx" | tail -1)
+          arch=$(podman image inspect --format '{{.Architecture}}' "$id")
+          if [ "$arch" != "${{ matrix.arch }}" ]; then echo "built $arch, want ${{ matrix.arch }}"; exit 1; fi
+          podman image inspect --format '{{index .Labels "reed.browser"}}' "$id"
+          echo "REED_IMAGE=$id" >> "$GITHUB_ENV"
+      # The image that is published passes reed's container tests first,
+      # on its own architecture; skipping fails.
+      - name: image-tested
+        working-directory: reed
+        env:
+          REED_REQUIRE_PODMAN: "1"
+        run: |
+          go test -count=1 -v -run 'TestContainer_' . | tee image-tested.log
+          if grep -q -- '--- SKIP' image-tested.log; then echo 'a test skipped'; exit 1; fi
+          grep -q -- '--- PASS: TestContainer_OnlyAllowedHostsAreReached' image-tested.log
+          grep -q -- '--- PASS: TestContainer_EveryVisitStartsClean' image-tested.log
+          grep -q -- '--- PASS: TestContainer_InAProgram' image-tested.log
+          grep -q -- '--- PASS: TestContainer_DevToolsIsNotExposed' image-tested.log
+          grep -q -- '--- PASS: TestContainer_OutputsAreBounded' image-tested.log
+          grep -q -- '--- PASS: TestContainer_ResolvePinsHosts' image-tested.log
+      - name: save
+        run: podman save --format oci-archive -o "$RUNNER_TEMP/reed-browser-${{ matrix.arch }}.tar" "$REED_IMAGE"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reed-browser-${{ matrix.arch }}
+          path: ${{ runner.temp }}/reed-browser-${{ matrix.arch }}.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  # Runs only when both architectures built and passed their tests.
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: reed-browser-*
+          path: ${{ runner.temp }}/images
+          merge-multiple: true
+      - name: publish
+        env:
+          REPO: ghcr.io/heedle-ai/reed-browser
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then tag=$GITHUB_REF_NAME; else tag="run-$GITHUB_RUN_ID"; fi
+          echo "$TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          podman manifest create reed-browser
+          for arch in amd64 arm64; do
+            podman manifest add reed-browser "oci-archive:$RUNNER_TEMP/images/reed-browser-$arch.tar"
+          done
+          podman manifest push --all --digestfile digest reed-browser "docker://$REPO:$tag"
+          ref="$REPO@$(cat digest)"
+          echo "$ref"
+          echo "Published \`$ref\` (tag \`$tag\`). Pin it in heedle's images.json as \"browser\"." >> "$GITHUB_STEP_SUMMARY"
