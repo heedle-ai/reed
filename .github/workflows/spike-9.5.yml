@@ -1,71 +1,137 @@
 name: Spike 9.5
 
-# Temporary (roadmap 9.5): runs Playwright MCP against Debian bookworm's
-# Chromium, in the Debian container image.yml pins, and drives a two-page
-# local form over stdio. Results are annotations. Removed once reported.
+# Temporary (roadmap 9.5): image.yml's build job, test step included, on
+# this branch, without saving or publishing anything, so the browser and
+# browser-agent images are built and tested on both architectures before
+# image-v2 is tagged. Generated from image.yml; removed before the merge.
 
 on:
   push:
     branches: [roadmap/9.5-browser-agent]
-    paths: ['.github/workflows/spike-9.5.yml', 'testdata/spike/**']
-  # round 3: reed's host resolver rules exclude the allowed address, as ChromiumFlags does
 
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 env:
+  # debian:bookworm-slim's multi-platform index, as docker-library/repo-info
+  # recorded it on 2026-11-04. A new base is a new digest here.
   DEBIAN: docker.io/library/debian@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
-  MCP: "@playwright/mcp@0.0.84"
-  NODE: "22.21.1"
+  # Node for the browser-agent image: the release, and each tarball's
+  # SHA-256 as nodejs.org's SHASUMS256.txt gives it.
+  NODE_VERSION: "22.21.1"
 
 jobs:
-  spike:
+  build:
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
-          - { runner: ubuntu-24.04, arch: amd64, narch: x64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64, narch: arm64 }
+          - runner: ubuntu-24.04       # linux/amd64
+            arch: amd64
+            node: linux-x64
+            node_sha256: NODE_SHA256_X64
+          - runner: ubuntu-24.04-arm   # linux/arm64, what a Mac's Podman machine runs
+            arch: arm64
+            node: linux-arm64
+            node_sha256: NODE_SHA256_ARM64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - name: decoy
-        # A server outside the container that counts every request reaching it.
-        shell: bash
+        with:
+          path: reed
+      - uses: actions/checkout@v4      # go.mod replaces the heedle-ai modules with ../
+        with:
+          repository: heedle-ai/weft
+          path: weft
+      - uses: actions/checkout@v4
+        with:
+          repository: heedle-ai/shuttle
+          path: shuttle
+      - uses: actions/checkout@v4
+        with:
+          repository: heedle-ai/draft
+          path: draft
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: reed/go.mod
+          cache-dependency-path: reed/go.sum
+      - name: podman
         run: |
-          cat > "$RUNNER_TEMP/decoy.py" <<'PY'
-          import http.server, sys
-          class H(http.server.BaseHTTPRequestHandler):
-              def do_GET(self):
-                  open(sys.argv[1], "a").write(self.path + "\n"); self.send_response(200); self.end_headers(); self.wfile.write(b"decoy")
-              def log_message(self, *a): pass
-          http.server.ThreadingHTTPServer(("0.0.0.0", 8099), H).serve_forever()
-          PY
-          : > "$RUNNER_TEMP/decoy.log"
-          nohup python3 "$RUNNER_TEMP/decoy.py" "$RUNNER_TEMP/decoy.log" >/dev/null 2>&1 &
-          sleep 1
-          curl -fsS http://127.0.0.1:8099/selftest && : > "$RUNNER_TEMP/decoy.log"
-          echo "DECOY_IP=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')" >> "$GITHUB_ENV"
-      - name: drive
-        shell: bash
+          if command -v podman >/dev/null; then :; else
+            sudo apt-get update >/dev/null
+            sudo apt-get install -y podman >/dev/null
+          fi
+          podman --version
+          # Rootless Podman needs subordinate IDs for images with more than
+          # one owner (review 36: the arm64 runner's were never checked).
+          if grep -q "^$USER:" /etc/subuid && grep -q "^$USER:" /etc/subgid; then :; else
+            sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$USER"
+            podman system migrate
+          fi
+          podman info --format '{{.Host.IDMappings.UIDMap}}'
+      - name: node-digests
         run: |
-          docker run --rm -v "$PWD/testdata/spike:/spike:ro" -e MCP -e NODE -e NARCH=${{ matrix.narch }} -e ARCH=${{ matrix.arch }} -e DECOY="http://$DECOY_IP:8099" "$DEBIAN" bash -c '
-            set -uo pipefail
-            note() { echo "::notice title=spike2-$ARCH $1::$2"; }
-            apt-get update -q >/dev/null
-            apt-get install -y -q --no-install-recommends chromium ca-certificates curl xz-utils fonts-dejavu-core >/dev/null
-            note chromium "$(/usr/lib/chromium/chromium --version 2>&1 | head -1)"
-            mkdir -p /opt/spike && cd /opt/spike
-            f=node-v$NODE-linux-$NARCH.tar.xz
-            curl -fsSLO https://nodejs.org/dist/v$NODE/$f && curl -fsSL https://nodejs.org/dist/v$NODE/SHASUMS256.txt | grep " $f\$" | sha256sum -c - >/dev/null && tar -xJf $f && rm $f
-            export PATH=/opt/spike/node-v$NODE-linux-$NARCH/bin:$PATH
-            npm install --no-save --ignore-scripts "$MCP" @modelcontextprotocol/sdk@1 >/dev/null 2>&1 || note npm "install failed"
-            cp /spike/drive2.mjs /opt/spike/
-            useradd -m reed; chmod -R a+rX /opt/spike
-            for mode in launch cdp; do for allow in yes no; do
-              out=$(su reed -s /bin/bash -c "cd /opt/spike && PATH=$PATH timeout 180 node drive2.mjs $mode /usr/lib/chromium/chromium /opt/spike/node_modules/@playwright/mcp/cli.js $allow $DECOY" 2>&1)
-              r=$(echo "$out" | grep "^RESULT " | tail -1)
-              note "$mode allow=$allow" "${r:-no result: $(echo "$out" | tail -5 | tr "\n" " " | cut -c1-600)}"
-            done; done
-          '
-          echo "::notice title=spike2-${{ matrix.arch }} decoy hits::$(wc -l < "$RUNNER_TEMP/decoy.log") $(head -5 "$RUNNER_TEMP/decoy.log" | tr '\n' ' ')"
+          sums=$(curl -fsSL "https://nodejs.org/dist/v$NODE_VERSION/SHASUMS256.txt")
+          for n in linux-x64 linux-arm64; do
+            echo "::notice title=node $n::$(echo "$sums" | grep " node-v$NODE_VERSION-$n.tar.xz$")"
+          done
+          echo "NODE_SHA_REAL=$(echo "$sums" | grep " node-v$NODE_VERSION-${{ matrix.node }}.tar.xz$" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+      - name: build
+        working-directory: reed
+        env:
+          NODE_TARBALL: node-v${{ env.NODE_VERSION }}-${{ matrix.node }}.tar.xz
+          NODE_SHA256: ${{ env.NODE_SHA_REAL }}
+        run: |
+          ctx="$RUNNER_TEMP/context"
+          actx="$RUNNER_TEMP/context-act"
+          mkdir -p "$ctx" "$actx"
+          podman run --rm -v "$PWD/scripts:/scripts:ro" -v "$PWD/agent:/agent:ro" -v "$ctx:/context" -v "$actx:/context-act" \
+            -e NODE_VERSION -e NODE_TARBALL -e NODE_SHA256 \
+            -e BUILD_IMAGE_CONTEXT=/context "$DEBIAN" bash -c '
+              set -euo pipefail
+              apt-get update -q >/dev/null
+              apt-get install -y -q --no-install-recommends chromium socat file fontconfig fonts-dejavu-core fonts-liberation ca-certificates curl xz-utils >/dev/null
+              bash /scripts/build-image.sh /usr/lib/chromium/chromium
+              # The browser-agent image: the same browser, Node and Playwright MCP.
+              cd /tmp
+              curl -fsSLO "https://nodejs.org/dist/v$NODE_VERSION/$NODE_TARBALL"
+              echo "$NODE_SHA256  $NODE_TARBALL" | sha256sum -c -
+              tar -xJf "$NODE_TARBALL"
+              node="/tmp/${NODE_TARBALL%.tar.xz}"
+              cp -r /agent /tmp/agent
+              (cd /tmp/agent && PATH="$node/bin:$PATH" npm ci --ignore-scripts --no-audit --no-fund)
+              BUILD_IMAGE_CONTEXT=/context-act BUILD_IMAGE_NODE="$node" BUILD_IMAGE_MCP=/tmp/agent bash /scripts/build-image.sh /usr/lib/chromium/chromium'
+          id=$(podman build --quiet --label org.opencontainers.image.source=https://github.com/heedle-ai/reed -f "$ctx/Containerfile" "$ctx" | tail -1)
+          act=$(podman build --quiet --label org.opencontainers.image.source=https://github.com/heedle-ai/reed -f "$actx/Containerfile" "$actx" | tail -1)
+          for i in "$id" "$act"; do
+            arch=$(podman image inspect --format '{{.Architecture}}' "$i")
+            if [ "$arch" != "${{ matrix.arch }}" ]; then echo "built $arch, want ${{ matrix.arch }}"; exit 1; fi
+          done
+          podman image inspect --format '{{index .Labels "reed.browser"}}' "$id"
+          podman image inspect --format '{{index .Labels "reed.browser"}} node {{index .Labels "reed.node"}} mcp {{index .Labels "reed.mcp"}}' "$act"
+          echo "REED_IMAGE=$id" >> "$GITHUB_ENV"
+          echo "REED_ACT_IMAGE=$act" >> "$GITHUB_ENV"
+      # The image that is published passes reed's container tests first,
+      # on its own architecture; skipping fails.
+      - name: image-tested
+        working-directory: reed
+        env:
+          REED_REQUIRE_PODMAN: "1"
+          REED_EXPECT_DEBIAN: "1"
+        run: |
+          go test -count=1 -v -run 'TestContainer_' . | tee image-tested.log
+          if grep -q -- '--- SKIP' image-tested.log; then echo 'a test skipped'; exit 1; fi
+          grep -q -- '--- PASS: TestContainer_OnlyAllowedHostsAreReached' image-tested.log
+          grep -q -- '--- PASS: TestContainer_EveryVisitStartsClean' image-tested.log
+          grep -q -- '--- PASS: TestContainer_InAProgram' image-tested.log
+          grep -q -- '--- PASS: TestContainer_DevToolsIsNotExposed' image-tested.log
+          grep -q -- '--- PASS: TestContainer_OutputsAreBounded' image-tested.log
+          grep -q -- '--- PASS: TestContainer_ResolvePinsHosts' image-tested.log
+          grep -q -- '--- PASS: TestContainer_ActOnlyAllowedHostsAreReached' image-tested.log
+          grep -q -- '--- PASS: TestContainer_ActFillsAForm' image-tested.log
+          grep -q -- '--- PASS: TestContainer_ActServerIsPinned' image-tested.log
+          grep -q -- '--- PASS: TestContainer_ActSessionsAreTheirOwn' image-tested.log

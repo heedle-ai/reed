@@ -56,6 +56,10 @@ jobs:
       # GitHub's Linux runners have Podman and Google Chrome; macOS runners
       # have no container engine. Here the browser image is built from the
       # runner's Chrome, and the container tests must run: skipping fails.
+      - uses: actions/setup-node@v4        # Node for the browser-agent image (roadmap 9.5)
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          node-version: "22.21.1"
       - name: containers
         if: matrix.os == 'ubuntu-latest'
         working-directory: reed
@@ -67,6 +71,9 @@ jobs:
           google-chrome --version
           REED_IMAGE=$(bash scripts/build-image.sh)   # fails the step if the build fails
           export REED_IMAGE
+          (cd agent && npm ci --ignore-scripts --no-audit --no-fund)
+          REED_ACT_IMAGE=$(BUILD_IMAGE_NODE="$(dirname "$(dirname "$(command -v node)")")" BUILD_IMAGE_MCP="$PWD/agent" bash scripts/build-image.sh)
+          export REED_ACT_IMAGE
           go test -count=1 -v -run 'TestContainer_' . | tee containers.log
           if grep -q -- '--- SKIP' containers.log; then echo 'a test skipped'; exit 1; fi
           grep -q -- '--- PASS: TestContainer_OnlyAllowedHostsAreReached' containers.log
@@ -75,3 +82,7 @@ jobs:
           grep -q -- '--- PASS: TestContainer_DevToolsIsNotExposed' containers.log
           grep -q -- '--- PASS: TestContainer_OutputsAreBounded' containers.log
           grep -q -- '--- PASS: TestContainer_ResolvePinsHosts' containers.log
+          grep -q -- '--- PASS: TestContainer_ActOnlyAllowedHostsAreReached' containers.log
+          grep -q -- '--- PASS: TestContainer_ActFillsAForm' containers.log
+          grep -q -- '--- PASS: TestContainer_ActServerIsPinned' containers.log
+          grep -q -- '--- PASS: TestContainer_ActSessionsAreTheirOwn' containers.log

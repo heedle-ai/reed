@@ -167,6 +167,20 @@ func publicEnough(ip net.IP) bool {
 // and only allowed host names resolve at all (a pinned name resolves to
 // its pinned address). WebRTC may not send UDP outside the (dead) proxy.
 func ChromiumFlags(allowed []string, resolve map[string]string) []string {
+	flags := []string{
+		"--headless", "--no-sandbox", // the container is the sandbox
+		"--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check",
+		"--user-data-dir=/tmp/profile", "--crash-dumps-dir=/tmp",
+		"--disable-background-networking", "--disable-component-update", "--disable-sync",
+		"--remote-debugging-port=9222", // on the container's own loopback only
+	}
+	flags = append(flags, allowlistSwitches(allowed, resolve)...)
+	return append(flags, "--window-size="+strconv.Itoa(Width)+","+strconv.Itoa(Height), "about:blank")
+}
+
+// allowlistSwitches are the switches that confine a Chromium to the
+// allowed hosts: browse's and act's browsers both start with them.
+func allowlistSwitches(allowed []string, resolve map[string]string) []string {
 	var rules []string
 	for _, h := range allowed {
 		if ip, ok := resolve[h]; ok {
@@ -182,17 +196,10 @@ func ChromiumFlags(allowed []string, resolve map[string]string) []string {
 		}
 	}
 	return []string{
-		"--headless", "--no-sandbox", // the container is the sandbox
-		"--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check",
-		"--user-data-dir=/tmp/profile", "--crash-dumps-dir=/tmp",
-		"--disable-background-networking", "--disable-component-update", "--disable-sync",
-		"--remote-debugging-port=9222", // on the container's own loopback only
 		"--proxy-server=http://127.0.0.1:9",
 		"--proxy-bypass-list=<-loopback>;" + strings.Join(allowed, ";"),
 		"--host-resolver-rules=" + strings.Join(rules, ", "),
 		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-		"--window-size=" + strconv.Itoa(Width) + "," + strconv.Itoa(Height),
-		"about:blank",
 	}
 }
 
@@ -200,8 +207,15 @@ func ChromiumFlags(allowed []string, resolve map[string]string) []string {
 // the executable. Nothing is published or mounted; the image comes after
 // every flag.
 func (b Browser) Argv(name string, allowed []string) []string {
+	argv := append(b.runOptions(name, Label), b.Image)
+	return append(argv, ChromiumFlags(allowed, b.Resolve)...)
+}
+
+// runOptions are podman run's options for a browser container labelled
+// label, before the image: browse's and act's containers share them.
+func (b Browser) runOptions(name, label string) []string {
 	argv := []string{
-		"run", "-d", "--rm", "--name", name, "--label", Label,
+		"run", "-d", "--rm", "--name", name, "--label", label,
 		"--pull=never", "--cap-drop=all", "--security-opt=no-new-privileges",
 		"--pids-limit=" + strconv.Itoa(PidsLimit), "--memory=" + MemoryLimit,
 		"--http-proxy=false", "--log-driver=none",
@@ -209,8 +223,7 @@ func (b Browser) Argv(name string, allowed []string) []string {
 	if b.Network != "" {
 		argv = append(argv, "--network="+b.Network)
 	}
-	argv = append(argv, b.Image)
-	return append(argv, ChromiumFlags(allowed, b.Resolve)...)
+	return argv
 }
 
 // RelayArgv is how reed reaches Chromium's DevTools port: socat inside the
@@ -225,25 +238,11 @@ func RelayArgv(name string) []string {
 // returning what it saw. The container is removed afterwards, whatever
 // happens.
 func (b Browser) Open(ctx context.Context, v Visit) (Page, error) {
-	allowed, err := v.Allowlist()
+	allowed, err := b.check(v, "no browser image configured (build one with scripts/build-image.sh and give the worker its ID)")
 	if err != nil {
 		return Page{}, err
 	}
-	if b.Image == "" {
-		return Page{}, fmt.Errorf("%w: no browser image configured (build one with scripts/build-image.sh and give the worker its ID)", ErrSetup)
-	}
-	if !pinned.MatchString(b.Image) {
-		return Page{}, fmt.Errorf("%w: image %q must be pinned: a full 64-hex image ID or name@sha256:<digest>", ErrInvalid, b.Image)
-	}
-	for h, ip := range b.Resolve {
-		if a := net.ParseIP(ip); a == nil || !hostName.MatchString(h) || !publicEnough(a) {
-			return Page{}, fmt.Errorf("%w: resolve %q to %q", ErrInvalid, h, ip)
-		}
-	}
-	podman := b.Podman
-	if podman == "" {
-		podman = "podman"
-	}
+	podman := b.podman()
 	ctx, cancel := context.WithTimeout(ctx, VisitTimeout)
 	defer cancel()
 	sweepOnce.Do(func() { _ = Sweep(ctx, podman, StaleAfter) })
@@ -268,6 +267,34 @@ func (b Browser) Open(ctx context.Context, v Visit) (Page, error) {
 		return Page{}, err
 	}
 	return drive(ctx, wsURL, v, allowed, b.frameEvery())
+}
+
+// check validates a visit and the browser's settings, returning the
+// allowlist; noImage says what to do when no image is configured.
+func (b Browser) check(v Visit, noImage string) ([]string, error) {
+	allowed, err := v.Allowlist()
+	if err != nil {
+		return nil, err
+	}
+	if b.Image == "" {
+		return nil, fmt.Errorf("%w: %s", ErrSetup, noImage)
+	}
+	if !pinned.MatchString(b.Image) {
+		return nil, fmt.Errorf("%w: image %q must be pinned: a full 64-hex image ID or name@sha256:<digest>", ErrInvalid, b.Image)
+	}
+	for h, ip := range b.Resolve {
+		if a := net.ParseIP(ip); a == nil || !hostName.MatchString(h) || !publicEnough(a) {
+			return nil, fmt.Errorf("%w: resolve %q to %q", ErrInvalid, h, ip)
+		}
+	}
+	return allowed, nil
+}
+
+func (b Browser) podman() string {
+	if b.Podman == "" {
+		return "podman"
+	}
+	return b.Podman
 }
 
 // startError classifies a failed podman run: the caller's deadline or
@@ -319,7 +346,13 @@ var sweepOnce sync.Once
 // are bounded by VisitTimeout, so a container that old isn't in use. The
 // first visit in each process sweeps with StaleAfter.
 func Sweep(ctx context.Context, podman string, olderThan time.Duration) error {
-	out, err := podmanCmd(ctx, podman, "ps", "-a", "--filter", "label="+Label, "--format", "json")
+	return sweep(ctx, podman, Label, olderThan)
+}
+
+// sweep removes the containers labelled label created more than olderThan
+// ago.
+func sweep(ctx context.Context, podman, label string, olderThan time.Duration) error {
+	out, err := podmanCmd(ctx, podman, "ps", "-a", "--filter", "label="+label, "--format", "json")
 	if err != nil {
 		return err
 	}

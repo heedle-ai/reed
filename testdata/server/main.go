@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -62,6 +64,38 @@ for (let i = 0; i < 3000; i++) fetch("http://blocked-srv:8080/" + i + "/" + "x".
 		})
 		http.HandleFunc("/never-ends", func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() })
 		http.HandleFunc("/same-origin", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, "same-origin-ok") })
+		// A two-page form for act (roadmap 9.5); /got says what arrived.
+		var mu sync.Mutex
+		var got []string
+		form := func(w http.ResponseWriter, title, body string) {
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprintf(w, "<!doctype html><title>%s</title><h1>%s</h1>%s", title, title, body)
+		}
+		keep := func(r *http.Request) {
+			r.ParseForm()
+			mu.Lock()
+			got = append(got, r.PostForm.Encode())
+			mu.Unlock()
+		}
+		http.HandleFunc("/volunteer", func(w http.ResponseWriter, r *http.Request) {
+			form(w, "Volunteer sign-up: you", `<form method=post action=/volunteer/2><label>Name <input name=name required></label>
+<label>Email <input name=email type=email required></label><button>Next</button></form>
+<img src="http://blocked-srv:8080/form-pixel.png"><script>fetch("http://blocked-srv:8080/form-fetch").catch(() => {})</script>`)
+		})
+		http.HandleFunc("POST /volunteer/2", func(w http.ResponseWriter, r *http.Request) {
+			keep(r)
+			form(w, "Volunteer sign-up: shift", `<form method=post action=/volunteer/done><label>Shift <select name=shift>
+<option>Friday</option><option>Saturday</option><option>Sunday</option></select></label><button>Submit</button></form>`)
+		})
+		http.HandleFunc("POST /volunteer/done", func(w http.ResponseWriter, r *http.Request) {
+			keep(r)
+			form(w, "Thank you", "<p>You're signed up for the shift.</p>")
+		})
+		http.HandleFunc("/got", func(w http.ResponseWriter, _ *http.Request) {
+			mu.Lock()
+			defer mu.Unlock()
+			fmt.Fprint(w, strings.Join(got, "\n"))
+		})
 		http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "text/html")
 			fmt.Fprint(w, page)

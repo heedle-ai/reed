@@ -13,6 +13,13 @@
 # Without an argument it uses chrome-headless-shell, google-chrome, then
 # chromium, from PATH. socat must be installed (apt install socat).
 #
+# With BUILD_IMAGE_NODE set to an unpacked Node.js release (the folder
+# with bin/node) and BUILD_IMAGE_MCP to a folder holding node_modules with
+# @playwright/mcp (npm ci in agent/), it builds the browser-agent image
+# instead: the same browser, plus Node and Playwright MCP, which drive it
+# for act steps (roadmap 9.5). Its entrypoint is Node; reed starts it idle
+# and runs Playwright MCP in it with podman exec.
+#
 # With BUILD_IMAGE_CONTEXT set to an empty folder, it writes the build
 # context there (rootfs/ and a Containerfile) and prints that folder
 # instead of building. The published image is assembled this way inside a
@@ -55,6 +62,12 @@ if [ ! -e "$dir/icudtl.dat" ] || ! compgen -G "$dir/*.pak" >/dev/null; then
   exit 1
 fi
 command -v socat >/dev/null || { echo "build-image: socat isn't installed" >&2; exit 1; }
+node=${BUILD_IMAGE_NODE:-}
+mcp=${BUILD_IMAGE_MCP:-}
+if [ -n "$node$mcp" ]; then
+  [ -x "$node/bin/node" ] || { echo "build-image: BUILD_IMAGE_NODE ($node) has no bin/node" >&2; exit 1; }
+  [ -f "$mcp/node_modules/@playwright/mcp/cli.js" ] || { echo "build-image: BUILD_IMAGE_MCP ($mcp) has no node_modules/@playwright/mcp" >&2; exit 1; }
+fi
 
 ctx=${BUILD_IMAGE_CONTEXT:-}
 if [ -n "$ctx" ]; then
@@ -79,6 +92,16 @@ while IFS= read -r lib; do
   mkdir -p "$root$(dirname "$lib")"
   cp -L "$lib" "$root$lib"
 done < <(libs "$real" "$(command -v socat)" "${sos[@]}" | sort -u)
+# The browser-agent image: Node and Playwright MCP, and Node's libraries.
+if [ -n "$node" ]; then
+  mkdir -p "$root/node/bin" "$root/mcp"
+  cp -L "$node/bin/node" "$root/node/bin/node"
+  cp -a "$mcp/node_modules" "$root/mcp/"
+  while IFS= read -r lib; do
+    mkdir -p "$root$(dirname "$lib")"
+    cp -L "$lib" "$root$lib"
+  done < <(libs "$node/bin/node" | sort -u)
+fi
 # Libraries Chromium opens at run time rather than linking.
 for extra in libnss3 libsoftokn3 libfreeblpriv3 libnssckbi; do
   for f in /usr/lib/x86_64-linux-gnu/$extra.so* /usr/lib/aarch64-linux-gnu/$extra.so* /usr/lib/x86_64-linux-gnu/nss/$extra.so* /usr/lib/aarch64-linux-gnu/nss/$extra.so*; do
@@ -108,6 +131,15 @@ label=${label:-unknown}
 label=${label//\\/\\\\}
 label=${label//\"/\\\"}
 label=${label//\$/\\\$}
+if [ -n "$node" ]; then
+  # The browser is always /browser/chromium here, as reed's act runs it.
+  [ "$name" = chromium ] || ln -s "$name" "$root/browser/chromium"
+  agent="LABEL reed.node=\"$("$node/bin/node" --version)\"
+LABEL reed.mcp=\"$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' "$mcp/node_modules/@playwright/mcp/package.json" | head -1)\"
+ENTRYPOINT [\"/node/bin/node\"]"
+else
+  agent="ENTRYPOINT [\"/browser/$name\"]"
+fi
 cat > "$work/Containerfile" <<CF
 FROM scratch
 COPY rootfs/ /
@@ -115,7 +147,7 @@ USER 65534
 ENV HOME=/home/reed
 ENV LD_LIBRARY_PATH=/browser:$libpath
 LABEL reed.browser="$label"
-ENTRYPOINT ["/browser/$name"]
+$agent
 CF
 if [ -n "$ctx" ]; then echo "$ctx"; exit 0; fi
 podman build --quiet -f "$work/Containerfile" "$work" | tail -1

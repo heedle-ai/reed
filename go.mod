@@ -1,6 +1,6 @@
 module github.com/heedle-ai/reed
 
-go 1.24.0
+go 1.25.0
 
 // Until the heedle-ai modules are published, build against sibling checkouts.
 replace (
@@ -16,7 +16,9 @@ require (
 	github.com/heedle-ai/draft v0.0.0
 	github.com/heedle-ai/shuttle v0.0.0
 	github.com/heedle-ai/weft v0.0.0
+	github.com/modelcontextprotocol/go-sdk v1.5.0
 	go.temporal.io/sdk v1.41.1
+	golang.org/x/image v0.33.0
 )
 
 require (
@@ -29,19 +31,24 @@ require (
 	github.com/gobwas/pool v0.2.1 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/mock v1.6.0 // indirect
+	github.com/google/jsonschema-go v0.4.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/go-grpc-middleware/v2 v2.3.2 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.22.0 // indirect
 	github.com/nexus-rpc/sdk-go v0.6.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/robfig/cron v1.2.0 // indirect
+	github.com/segmentio/asm v1.1.3 // indirect
+	github.com/segmentio/encoding v0.5.4 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
 	github.com/stretchr/testify v1.10.0 // indirect
+	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	go.temporal.io/api v1.62.2 // indirect
 	golang.org/x/net v0.39.0 // indirect
-	golang.org/x/sync v0.13.0 // indirect
-	golang.org/x/sys v0.34.0 // indirect
-	golang.org/x/text v0.24.0 // indirect
+	golang.org/x/oauth2 v0.35.0 // indirect
+	golang.org/x/sync v0.18.0 // indirect
+	golang.org/x/sys v0.41.0 // indirect
+	golang.org/x/text v0.31.0 // indirect
 	golang.org/x/time v0.3.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20240827150818-7e3bb234dfed // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240827150818-7e3bb234dfed // indirect
