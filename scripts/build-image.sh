@@ -12,6 +12,12 @@
 #
 # Without an argument it uses chrome-headless-shell, google-chrome, then
 # chromium, from PATH. socat must be installed (apt install socat).
+#
+# With BUILD_IMAGE_CONTEXT set to an empty folder, it writes the build
+# context there (rootfs/ and a Containerfile) and prints that folder
+# instead of building. The published image is assembled this way inside a
+# Debian container, which has no Podman, and built outside it
+# (.github/workflows/image.yml).
 set -euo pipefail
 bin=${1:-}
 if [ -z "$bin" ]; then
@@ -50,8 +56,15 @@ if [ ! -e "$dir/icudtl.dat" ] || ! compgen -G "$dir/*.pak" >/dev/null; then
 fi
 command -v socat >/dev/null || { echo "build-image: socat isn't installed" >&2; exit 1; }
 
-work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+ctx=${BUILD_IMAGE_CONTEXT:-}
+if [ -n "$ctx" ]; then
+  if [ -d "$ctx" ] && [ -z "$(ls -A "$ctx")" ]; then work=$ctx; else
+    echo "build-image: BUILD_IMAGE_CONTEXT ($ctx) must be an empty folder" >&2; exit 1
+  fi
+else
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' EXIT
+fi
 root="$work/rootfs"
 mkdir -p "$root/browser" "$root/tmp" "$root/etc" "$root/home/reed"
 chmod 1777 "$root/tmp"
@@ -90,12 +103,18 @@ chmod 1777 "$root/home/reed"
 
 # A FROM scratch image has no loader cache: name the library folders.
 libpath=$(cd "$root" && find . -name '*.so*' \( -type f -o -type l \) -not -path './browser/*' -printf '/%h\n' | sed 's#^/\./#/#' | sort -u | paste -sd:)
+label=$("$real" --version 2>/dev/null | head -1 || true)
+label=${label:-unknown}
+label=${label//\\/\\\\}
+label=${label//\"/\\\"}
 cat > "$work/Containerfile" <<CF
 FROM scratch
 COPY rootfs/ /
 USER 65534
 ENV HOME=/home/reed
 ENV LD_LIBRARY_PATH=/browser:$libpath
+LABEL reed.browser="$label"
 ENTRYPOINT ["/browser/$name"]
 CF
-podman build --quiet --label "reed.browser=$("$real" --version 2>/dev/null | head -1 || echo unknown)" -f "$work/Containerfile" "$work" | tail -1
+if [ -n "$ctx" ]; then echo "$ctx"; exit 0; fi
+podman build --quiet -f "$work/Containerfile" "$work" | tail -1

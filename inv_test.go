@@ -346,3 +346,63 @@ func TestInv_CIChecksCanFail(t *testing.T) {
 		}
 	}
 }
+
+// TestInv_ImageIsTestedBeforeItIsPublished: the browser image is built
+// on both Linux architectures, each passes the container tests
+// (ci:image-tested) before it is saved, and only a job that needs both
+// builds may push, by digest with a manifest list. (roadmap 9.1)
+func TestInv_ImageIsTestedBeforeItIsPublished(t *testing.T) {
+	b, err := os.ReadFile(".github/workflows/image.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	for _, want := range []string{"runner: ubuntu-24.04 ", "runner: ubuntu-24.04-arm ", "\n  publish:\n    needs: build\n", "podman manifest push --all --digestfile"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("image.yml lacks %q", want)
+		}
+	}
+	publish := strings.Index(s, "\n  publish:\n")
+	order := []string{"- name: build\n", "- name: image-tested\n", "- name: save\n", "actions/upload-artifact"}
+	last := -1
+	for _, step := range order {
+		i := strings.Index(s, step)
+		if i < 0 || i < last || (publish >= 0 && i > publish) {
+			t.Errorf("image.yml: the build job must run %q in this order, before publish: %v", step, order)
+		}
+		last = i
+	}
+	for _, w := range []string{"packages: write", "podman login", "manifest push"} {
+		if i := strings.Index(s, w); i < 0 || publish < 0 || i < publish {
+			t.Errorf("image.yml: %q may appear only in the publish job", w)
+		}
+	}
+	if strings.Contains(s, "podman push") {
+		t.Error("image.yml: images are pushed only with their manifest list (podman manifest push --all)")
+	}
+}
+
+// TestInv_ImageBaseIsPinned: every image the workflow names is pinned by
+// digest, and nothing anywhere uses :latest. (roadmap 9.1)
+func TestInv_ImageBaseIsPinned(t *testing.T) {
+	b, err := os.ReadFile(".github/workflows/image.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs := regexp.MustCompile(`docker\.io/\S+`).FindAllString(string(b), -1)
+	if len(refs) == 0 {
+		t.Fatal("image.yml names no base image")
+	}
+	pinned := regexp.MustCompile(`^docker\.io/[a-z0-9./_-]+@sha256:[0-9a-f]{64}$`)
+	for _, r := range refs {
+		if !pinned.MatchString(r) {
+			t.Errorf("image.yml: %s isn't pinned by digest", r)
+		}
+	}
+	for _, f := range []string{".github/workflows/image.yml", "scripts/build-image.sh"} {
+		b, _ := os.ReadFile(f)
+		if strings.Contains(string(b), ":latest") {
+			t.Errorf("%s uses :latest", f)
+		}
+	}
+}
