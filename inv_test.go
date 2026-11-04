@@ -391,6 +391,39 @@ func TestInv_ImageIsTestedBeforeItIsPublished(t *testing.T) {
 	if !strings.Contains(s, "fail-fast: true") || !strings.Contains(s, "if-no-files-found: error") {
 		t.Error("image.yml: both architectures must build, and both archives must exist, or nothing is published")
 	}
+	// Review 36, round 2: the image the tests run against must be the one
+	// built, and the one saved and published; the tests must require Podman,
+	// fail on a skip, and each expected pass must be checked.
+	build := s[:max(publish, 0)]
+	for _, bad := range []string{"||", "; true", "--from"} {
+		if strings.Contains(build, bad) {
+			t.Errorf("image.yml's build job uses %q", bad)
+		}
+	}
+	want := map[string][]string{
+		"build": {"id=$(podman build --quiet ", `echo "REED_IMAGE=$id" >> "$GITHUB_ENV"` + "\n"},
+		"image-tested": {
+			`REED_REQUIRE_PODMAN: "1"` + "\n",
+			"go test -count=1 -v -run 'TestContainer_' . | tee image-tested.log\n",
+			"if grep -q -- '--- SKIP' image-tested.log; then echo 'a test skipped'; exit 1; fi\n",
+			"grep -q -- '--- PASS: TestContainer_OnlyAllowedHostsAreReached' image-tested.log\n",
+			"grep -q -- '--- PASS: TestContainer_EveryVisitStartsClean' image-tested.log\n",
+			"grep -q -- '--- PASS: TestContainer_InAProgram' image-tested.log\n",
+			"grep -q -- '--- PASS: TestContainer_DevToolsIsNotExposed' image-tested.log\n",
+			"grep -q -- '--- PASS: TestContainer_OutputsAreBounded' image-tested.log\n",
+			"grep -q -- '--- PASS: TestContainer_ResolvePinsHosts' image-tested.log\n",
+		},
+		"save":   {`"$REED_IMAGE"` + "\n"},
+		"podman": {"--add-subuids 100000-165535 --add-subgids 100000-165535"},
+	}
+	for name, lines := range want {
+		step := imageStep(build, name)
+		for _, l := range lines {
+			if !strings.Contains(step, l) {
+				t.Errorf("image.yml's %s step lacks %q", name, strings.TrimSpace(l))
+			}
+		}
+	}
 }
 
 // TestInv_ImageBaseIsPinned: every image the workflow names is pinned by
@@ -496,4 +529,18 @@ func TestInv_BuildImageContextMode(t *testing.T) {
 	if b, _ := os.ReadFile(calls); !strings.HasPrefix(string(b), "build --quiet -f ") {
 		t.Errorf("without BUILD_IMAGE_CONTEXT, podman ran %q", b)
 	}
+}
+
+// imageStep is the text of the step called name in a workflow's job, up to
+// the next step.
+func imageStep(job, name string) string {
+	i := strings.Index(job, "- name: "+name+"\n")
+	if i < 0 {
+		return ""
+	}
+	rest := job[i+len("- name: "+name+"\n"):]
+	if j := strings.Index(rest, "\n      - "); j >= 0 {
+		rest = rest[:j+1]
+	}
+	return rest
 }
