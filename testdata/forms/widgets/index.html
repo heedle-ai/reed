@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Order a tea towel</title>
+<h1>Order a tea towel</h1>
+<form method="post" action="/widgets/submit">
+  <label>Delivery date <input type="date" name="date" min="2026-01-01" max="2027-12-31"></label>
+  <fieldset>
+    <legend>Size</legend>
+    <label><input type="radio" name="size" value="small"> Small</label>
+    <label><input type="radio" name="size" value="medium"> Medium</label>
+    <label><input type="radio" name="size" value="large"> Large</label>
+  </fieldset>
+  <fieldset>
+    <legend>Extras</legend>
+    <label><input type="checkbox" name="extras" value="gift"> Gift wrap</label>
+    <label><input type="checkbox" name="extras" value="newsletter" checked> Send me the newsletter</label>
+  </fieldset>
+  <label>Country
+    <select name="country">
+      <option value="">Choose a country</option>
+      <option>Portugal</option>
+      <option>Spain</option>
+    </select>
+  </label>
+  <label>City <select name="city" disabled><option value="">Choose a country first</option></select></label>
+  <label><input type="checkbox" name="terms"> I accept the terms</label>
+  <button>Order</button>
+</form>
+<script>
+  // The cities depend on the country.
+  const cities = { Portugal: ["Lisbon", "Porto", "Faro"], Spain: ["Madrid", "Seville"] };
+  const country = document.querySelector("select[name=country]"), city = document.querySelector("select[name=city]");
+  country.addEventListener("change", () => {
+    city.replaceChildren(new Option("Choose a city", ""), ...(cities[country.value] || []).map((c) => new Option(c)));
+    city.disabled = !cities[country.value];
+  });
+</script>
