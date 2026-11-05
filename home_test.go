@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -97,5 +98,36 @@ func TestInv_BrowserContainersSayTheirHome(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); err == nil {
 		t.Error("podman ran for a home that should have been refused")
+	}
+}
+
+// TestInv_SweepsNeverCutAnotherHomesBrowser: Sweep removes browsers by
+// reed's own labels, whichever home started them, so it only ever takes
+// one past its own deadline: a browse visit's (VisitTimeout) is well
+// under StaleAfter, and an act session's (SessionTimeout) under
+// StaleActAfter. Home A starting can't cut home B's live browser
+// (REED-521, review 55).
+func TestInv_SweepsNeverCutAnotherHomesBrowser(t *testing.T) {
+	if reed.VisitTimeout >= reed.StaleAfter || reed.SessionTimeout >= reed.StaleActAfter {
+		t.Errorf("a sweep could remove a live browser: VisitTimeout %v, StaleAfter %v, SessionTimeout %v, StaleActAfter %v",
+			reed.VisitTimeout, reed.StaleAfter, reed.SessionTimeout, reed.StaleActAfter)
+	}
+}
+
+// TestInv_NoStrayFiles: nothing a test run leaves behind is tracked: no
+// empty file at the repository's root (REED-522, review 55: an empty
+// "oom" was committed).
+func TestInv_NoStrayFiles(t *testing.T) {
+	out, err := exec.Command("git", "ls-files").Output()
+	if err != nil {
+		t.Skip("not a git checkout")
+	}
+	for _, f := range strings.Fields(string(out)) {
+		if strings.Contains(f, "/") {
+			continue
+		}
+		if fi, err := os.Stat(f); err == nil && fi.Size() == 0 {
+			t.Errorf("%s is an empty file at the root", f)
+		}
 	}
 }
