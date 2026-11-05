@@ -293,7 +293,12 @@ func TestContainer_ActUsesProfileWithoutShowingIt(t *testing.T) {
 		t.Errorf("the filled form, as the model sees it:\n%s", after)
 	}
 	// The frame: the name and email fields masked, the phone not.
-	shot := do("browser_run_code_unsafe", map[string]any{"code": reed.ShotJS})
+	// Review 42: a frame isn't taken unless the browser has every detail
+	// to mask.
+	if out, isErr := call(t, cs, "browser_run_code_unsafe", map[string]any{"code": reed.ShotJSFor(3)}); !isErr {
+		t.Errorf("a frame with a detail missing from the mask: %.200s", out)
+	}
+	shot := do("browser_run_code_unsafe", map[string]any{"code": reed.ShotJSFor(2)})
 	b64 := result(t, shot)
 	pic, err := jpeg.Decode(base64.NewDecoder(base64.StdEncoding, strings.NewReader(b64)))
 	if err != nil {
@@ -304,7 +309,7 @@ func TestContainer_ActUsesProfileWithoutShowingIt(t *testing.T) {
 	if json.Unmarshal([]byte(result(t, boxes)), &rects) != nil || len(rects) != 3 {
 		t.Fatalf("boxes: %s", boxes)
 	}
-	masked := func(r struct{ X, Y, Width, Height float64 }) float64 {
+	masked := func(r struct{ X, Y, Width, Height float64 }) float64 { // of pic
 		in, all := 0, 0
 		for y := int(r.Y) + 2; y < int(r.Y+r.Height)-2; y++ {
 			for x := int(r.X) + 2; x < int(r.X+r.Width)-2; x++ {
@@ -320,7 +325,29 @@ func TestContainer_ActUsesProfileWithoutShowingIt(t *testing.T) {
 	if n, e, p := masked(rects[0]), masked(rects[1]), masked(rects[2]); n < 0.9 || e < 0.9 || p > 0.2 {
 		t.Errorf("masked: name %.2f, email %.2f, phone %.2f", n, e, p)
 	}
+	// Review 42: a page reading a filled field and sending it on with a
+	// GET, encoded, is held like a send.
+	do("browser_run_code_unsafe", map[string]any{"code": `async (page) => { await page.evaluate(() => {
+  const e = document.querySelector("input[name=email]").value, n = document.querySelector("input[name=name]").value;
+  new Image().src = "/contact/?e=" + encodeURIComponent(e);
+  fetch("/contact/?n=" + n.replace(/ /g, "+")).catch(() => {});
+}); await new Promise((r) => setTimeout(r, 1500)); return "done"; }`})
+	if held := do("browser_run_code_unsafe", map[string]any{"code": reed.HeldJS}); !strings.Contains(held, "GET http://forms-srv:8080/contact/?e=") || !strings.Contains(held, "GET http://forms-srv:8080/contact/?n=") {
+		t.Errorf("a GET carrying a detail wasn't held: %s", held)
+	}
+	// Review 42: the files holding the details can't be opened in the browser.
+	if out, _ := call(t, cs, "browser_navigate", map[string]any{"url": "file://" + reed.ActProfile}); strings.Contains(out, "ada@") || strings.Contains(out, "Ada Lovelace") {
+		t.Errorf("file: opened: %s", out)
+	}
 	// What arrives is the real value.
+	do("browser_navigate", map[string]any{"url": "http://forms-srv:8080/contact/"})
+	snap = do("browser_snapshot", nil)
+	do("browser_fill_form", map[string]any{"fields": []map[string]any{
+		{"name": "Full name", "type": "textbox", "target": ref(t, snap, `textbox "Full name"`), "value": "⟨name⟩"},
+		{"name": "Email", "type": "textbox", "target": ref(t, snap, `textbox "Email"`), "value": "⟨email⟩"},
+		{"name": "Phone", "type": "textbox", "target": ref(t, snap, `textbox "Phone"`), "value": "020 7946 0018"},
+		{"name": "Message", "type": "textbox", "target": ref(t, snap, `textbox "Message"`), "value": "Please call me back."},
+	}})
 	snap = do("browser_snapshot", nil)
 	do("browser_run_code_unsafe", map[string]any{"code": reed.ReleaseJS})
 	do("browser_click", map[string]any{"element": "Send", "target": ref(t, snap, `button "Send"`)})
@@ -328,6 +355,36 @@ func TestContainer_ActUsesProfileWithoutShowingIt(t *testing.T) {
 	got := check("contact").Received
 	if len(got) != before+1 || !strings.Contains(got[len(got)-1], "name=Ada+Lovelace") || !strings.Contains(got[len(got)-1], "email=ada%40example.org") {
 		t.Errorf("received %v", got)
+	}
+	// Review 42: a value the page reformats, uppercases or spells out, in
+	// a frame or a shadow root, is masked too; other text isn't.
+	do("browser_run_code_unsafe", map[string]any{"code": `async (page) => { await page.setContent(` + "`" + `
+<style>input, div { display:block; width:300px; height:30px; margin:8px; font:16px sans-serif; } iframe { width:340px; height:60px; border:0; }</style>
+<input id=upper value="ADA LOVELACE">
+<input id=other value="Grace Hopper">
+<div id=spelled>A d a  L o v e l a c e</div>
+<iframe srcdoc="<input style='width:300px;height:30px' value='ADA@example.org'>"></iframe>
+<div id=host></div>` + "`" + `);
+  await page.evaluate(() => { const s = document.getElementById("host").attachShadow({ mode: "open" }); s.innerHTML = '<input style="width:300px;height:30px" value="ada@example.org">'; });
+  await page.waitForTimeout(500); return "set"; }`})
+	shot = do("browser_run_code_unsafe", map[string]any{"code": reed.ShotJSFor(2)})
+	if pic, err = jpeg.Decode(base64.NewDecoder(base64.StdEncoding, strings.NewReader(result(t, shot)))); err != nil {
+		t.Fatal(err)
+	}
+	boxes = do("browser_run_code_unsafe", map[string]any{"code": `async (page) => JSON.stringify(await Promise.all([
+  page.locator("#upper").boundingBox(), page.locator("#spelled").boundingBox(), page.frameLocator("iframe").locator("input").boundingBox(),
+  page.locator("#host input").boundingBox(), page.locator("#other").boundingBox()]))`})
+	rects = nil
+	if json.Unmarshal([]byte(result(t, boxes)), &rects) != nil || len(rects) != 5 {
+		t.Fatalf("boxes: %s", boxes)
+	}
+	for i, name := range []string{"uppercased", "spelled out", "in a frame", "in a shadow root"} {
+		if m := masked(rects[i]); m < 0.9 {
+			t.Errorf("%s: masked %.2f", name, m)
+		}
+	}
+	if m := masked(rects[4]); m > 0.2 {
+		t.Errorf("other text masked %.2f", m)
 	}
 }
 
