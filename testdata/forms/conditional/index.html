@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Book a visit</title>
+<h1>Book a visit</h1>
+<form method="post" action="/conditional/submit">
+  <label>Your name <input name="name"></label>
+  <fieldset>
+    <legend>Do you need parking?</legend>
+    <label><input type="radio" name="parking" value="yes"> Yes</label>
+    <label><input type="radio" name="parking" value="no"> No</label>
+  </fieldset>
+  <p id="car" hidden><label>Car registration <input name="plate" disabled></label></p>
+  <button>Book</button>
+</form>
+<script>
+  // The registration field appears only for parking.
+  for (const r of document.querySelectorAll("input[name=parking]")) r.addEventListener("change", () => {
+    const yes = document.querySelector("input[name=parking]:checked").value === "yes";
+    document.getElementById("car").hidden = !yes;
+    document.querySelector("input[name=plate]").disabled = !yes;
+  });
+</script>

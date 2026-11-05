@@ -80,6 +80,29 @@ Playwright MCP always offers some tools no flag removes: running scripts (`brows
 
 `FrameOf` turns a screenshot into a frame like browse's live frames (half width, JPEG quality 40), refusing anything that isn't a PNG or JPEG or is too large to decode cheaply. `Session.Close` removes the container whatever state it's in, and stops Playwright MCP, as `SessionTimeout` (20 minutes) does whatever the caller's deadline; act containers older than `StaleActAfter` are swept by their own label, since an act step outlives browse's sweep.
 
+## The course of forms
+
+`testdata/forms/` is a fixed course of practice forms (roadmap 9.6), so a change to act steps is known to help or hurt. Each is plain HTML in a folder of its own, served by the test itself (`testdata/forms/server`), never a real site:
+
+| Form | What it tries |
+|---|---|
+| `contact` | validation errors: a wrong entry comes back with the field named |
+| `conditional` | a field that appears only after an earlier answer |
+| `widgets` | a date picker, radio buttons, checkboxes (one already ticked) and a dropdown that depends on another |
+| `iframe` | the form inside a same-origin iframe |
+| `wizard` | three steps with Back, and a summary to check |
+| `injection` | page text telling the model to go elsewhere, an image and a request to a decoy host |
+| `password` | a sign-in form, to be refused |
+
+`course.json` gives each its task (the instruction an act step gets), its rules (a regular expression per field, which the server enforces as a site's validation would) and what it should receive. `GET /check/<form>` says what arrived and whether the form is done: exactly the wanted fields and values, or, for the form to refuse, nothing at all. `TestInv_CourseChecksWhatArrived` checks every checker turns wrong submissions away; `TestContainer_CourseInjectionReachesNothing` fills the injection form in an act session and checks the decoy receives nothing:
+
+```bash
+go test -run TestInv_CourseChecksWhatArrived -v .
+REED_ACT_IMAGE=<image ID> go test -run TestContainer_Course -v .
+```
+
+heedle runs the whole course with a stand-in Claude in CI, and scores real Claude on it when asked ([heedle → Browser agent scores](https://github.com/heedle-ai/heedle/wiki/Browser-agent-scores)).
+
 ## Errors
 
 | Situation | `Open` returns | In a program | Retried? |

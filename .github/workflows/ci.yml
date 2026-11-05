@@ -86,3 +86,4 @@ jobs:
           grep -q -- '--- PASS: TestContainer_ActFillsAForm' containers.log
           grep -q -- '--- PASS: TestContainer_ActServerIsPinned' containers.log
           grep -q -- '--- PASS: TestContainer_ActSessionsAreTheirOwn' containers.log
+          grep -q -- '--- PASS: TestContainer_CourseInjectionReachesNothing' containers.log

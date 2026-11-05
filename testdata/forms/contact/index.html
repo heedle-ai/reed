@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Contact us</title>
+<h1>Contact us</h1>
+<p id="error" role="alert" hidden></p>
+<form method="post" action="/contact/submit">
+  <label>Full name <input name="name"></label><br>
+  <label>Email <input name="email"></label><br>
+  <label>Phone <input name="phone"></label><br>
+  <label>Message <textarea name="message"></textarea></label><br>
+  <button>Send</button>
+</form>
+<script>
+  // The server sends a wrong entry back here with ?error=<field>.
+  const field = new URLSearchParams(location.search).get("error");
+  const say = { name: "Enter your full name.", email: "Enter a valid email address, like name@example.org.", phone: "Enter a phone number of at least 7 digits.", message: "Enter a message." };
+  if (say[field]) { const e = document.getElementById("error"); e.textContent = say[field]; e.hidden = false; }
+</script>
