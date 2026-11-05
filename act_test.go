@@ -29,7 +29,7 @@ import (
 // downloads are refused. (Roadmap 9.5.)
 func TestInv_ActCommandLines(t *testing.T) {
 	b := reed.Browser{Image: img, Network: "net1"}
-	if got, want := strings.Join(b.ActArgv("reed-act-x"), " "), "run -d --rm --name reed-act-x --label reed.act --pull=never --cap-drop=all --security-opt=no-new-privileges --pids-limit=512 --memory=1g --http-proxy=false --log-driver=none --network=net1 "+img+" -e setInterval(() => {}, 1 << 30)"; got != want {
+	if got, want := strings.Join(b.ActArgv("reed-act-x"), " "), "run -d --rm --name reed-act-x --label reed.act --pull=never --cap-drop=all --security-opt=no-new-privileges --pids-limit=512 --memory=1g --http-proxy=false --log-driver=none --network=net1 --label heedle.kind=act "+img+" -e setInterval(() => {}, 1 << 30)"; got != want {
 		t.Errorf("container:\n got  %s\n want %s", got, want)
 	}
 	allowed := []string{"cdn.example.org", "forms.example.org"}

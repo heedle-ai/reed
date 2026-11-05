@@ -39,7 +39,7 @@ var img = strings.Repeat("ab", 32)
 func TestInv_ExactPodmanCommandLines(t *testing.T) {
 	b := reed.Browser{Image: img, Network: "net1"}
 	argv := strings.Join(b.Argv("reed-x", []string{"a.example"}), " ")
-	want := "run -d --rm --name reed-x --label reed.visit --pull=never --cap-drop=all --security-opt=no-new-privileges --pids-limit=512 --memory=1g --http-proxy=false --log-driver=none --network=net1 " + img + " --headless --no-sandbox"
+	want := "run -d --rm --name reed-x --label reed.visit --pull=never --cap-drop=all --security-opt=no-new-privileges --pids-limit=512 --memory=1g --http-proxy=false --log-driver=none --network=net1 --label heedle.kind=browse " + img + " --headless --no-sandbox"
 	if !strings.HasPrefix(argv, want) {
 		t.Errorf("browser:\n got  %s\n want %s…", argv, want)
 	}
@@ -160,7 +160,9 @@ func TestInv_NoMounts(t *testing.T) {
 	for i := 0; i < st.NumField(); i++ {
 		fields = append(fields, st.Field(i).Name)
 	}
-	if got := strings.Join(fields, " "); got != "Podman Image Network Resolve FrameEvery" {
+	// run (REED-500) is a visit's run labels, names only, set by Open and
+	// Start on their own copy.
+	if got := strings.Join(fields, " "); got != "Podman Image Network Resolve FrameEvery run" {
 		t.Errorf("Browser fields = %s; adding a field needs a new invariant", got)
 	}
 }

@@ -97,6 +97,7 @@ func (b Browser) Start(ctx context.Context, v Visit) (*Session, error) {
 		return nil, err
 	}
 	podman := b.podman()
+	b.run = v.Labels
 	// A session lasts minutes: sweeping each time costs one podman ps.
 	_ = sweep(ctx, podman, ActLabel, StaleActAfter)
 	var rnd [6]byte

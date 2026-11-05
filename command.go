@@ -40,7 +40,7 @@ func Command(o Opener) weft.Arrow[plan.Input, string] {
 		if len(in.Args) == 0 {
 			return "", temporal.NewNonRetryableApplicationError("browse needs a URL", "InvalidInput", nil)
 		}
-		v := Visit{URL: in.Args[0], Allow: in.Args[1:]}
+		v := Visit{URL: in.Args[0], Allow: in.Args[1:], Labels: StepLabels(ctx, in.NodeID)}
 		if activity.IsActivity(ctx) {
 			v.OnFrame = func(f Frame) { activity.RecordHeartbeat(ctx, f) }
 		}
