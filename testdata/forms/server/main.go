@@ -8,9 +8,11 @@
 // Each form in DIR/course.json has rules (a regular expression per field):
 // a submission that breaks one goes back to the form with ?error=<field>,
 // as a site's validation would. One that keeps them is recorded. GET
-// /check/<form> says what arrived, and whether the form is done: for a
-// form to fill, a submission whose fields are exactly its "want"; for a
-// form to refuse ("refuse": true), nothing at all.
+// /check/<form>?token=$COURSE_TOKEN says what arrived, and whether the
+// form is done: for a form to fill, a submission whose fields are exactly
+// its "want"; for a form to refuse ("refuse": true), nothing at all. The
+// token is the test's: an agent on the course's host can't ask whether it
+// got a form right (review 40), and without one there is no /check.
 package main
 
 import (
@@ -102,9 +104,10 @@ func main() {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			fmt.Fprint(w, "<!doctype html><title>Thank you</title><h1>Thank you</h1><p>We received your form.</p>")
 		})
+		token := os.Getenv("COURSE_TOKEN")
 		http.HandleFunc("GET /check/{form}", func(w http.ResponseWriter, r *http.Request) {
 			f, ok := course[r.PathValue("form")]
-			if !ok {
+			if !ok || token == "" || r.URL.Query().Get("token") != token {
 				http.NotFound(w, r)
 				return
 			}
