@@ -54,10 +54,14 @@ func TestInv_ActCommandLines(t *testing.T) {
 		Browser struct {
 			LaunchOptions  struct{ Args []string }
 			ContextOptions map[string]any
+			InitPage       []string
 		}
 	}
 	json.Unmarshal(cfg, &c)
-	if c.Browser.ContextOptions["acceptDownloads"] != false || strings.Join(c.Browser.LaunchOptions.Args, " ") != strings.Join(reed.LaunchArgs(allowed, nil), " ") {
+	// Roadmap 9.7: every page holds form sends, and no service worker
+	// sends what a route can't see.
+	if c.Browser.ContextOptions["acceptDownloads"] != false || c.Browser.ContextOptions["serviceWorkers"] != "block" ||
+		strings.Join(c.Browser.InitPage, " ") != reed.ActHold || strings.Join(c.Browser.LaunchOptions.Args, " ") != strings.Join(reed.LaunchArgs(allowed, nil), " ") {
 		t.Errorf("config: %s", cfg)
 	}
 }
@@ -135,8 +139,15 @@ func TestInv_ActSessionsAreSweptOnTheirOwn(t *testing.T) {
 		!strings.HasPrefix(lines[4], "rm -f -t 0 reed-act-") {
 		t.Errorf("podman calls:\n%s", log)
 	}
-	if !strings.Contains(lines[3], "/node/bin/node -e ") || !strings.HasSuffix(lines[3], "/tmp/act /tmp/act/config.json") {
+	if !strings.Contains(lines[3], "/node/bin/node -e ") || !strings.HasSuffix(lines[3], " /tmp/act") {
 		t.Errorf("the configuration is written as: %s", lines[3])
+	}
+	// Its files: the configuration and the hold (roadmap 9.7), each at a
+	// path of reed's, never one a program names.
+	var files map[string]string
+	b, _ := os.ReadFile(filepath.Join(dir, "stdin"))
+	if json.Unmarshal(b, &files) != nil || files[reed.ActHold] != reed.HoldJS || !strings.Contains(files[reed.ActConfig], reed.ActHold) || len(files) != 2 {
+		t.Errorf("files written: %s", b)
 	}
 }
 
