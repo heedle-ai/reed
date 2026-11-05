@@ -87,6 +87,8 @@ type Browser struct {
 	// FrameEvery is how often Visit sends a live frame to OnFrame; zero
 	// means every 2 seconds.
 	FrameEvery time.Duration
+	// run is the visit's run labels, set on this copy by Open and Start.
+	run map[string]string
 }
 
 // Visit is one page load.
@@ -98,6 +100,11 @@ type Visit struct {
 	// OnFrame, if set, receives a small JPEG of the page while it loads
 	// and is read, every FrameEvery.
 	OnFrame func(Frame)
+	// Labels are heedle's run labels for the visit's container
+	// (heedle.workflow, heedle.run, heedle.step; roadmap 9.2): reed adds
+	// heedle.kind. The browse command sets them from Temporal's activity
+	// info (StepLabels).
+	Labels map[string]string
 }
 
 // Frame is one live view of the browser.
@@ -213,6 +220,7 @@ func (b Browser) Argv(name string, allowed []string) []string {
 
 // runOptions are podman run's options for a browser container labelled
 // label, before the image: browse's and act's containers share them.
+// heedle's labels come last, after every fixed flag (REED-500).
 func (b Browser) runOptions(name, label string) []string {
 	argv := []string{
 		"run", "-d", "--rm", "--name", name, "--label", label,
@@ -223,7 +231,11 @@ func (b Browser) runOptions(name, label string) []string {
 	if b.Network != "" {
 		argv = append(argv, "--network="+b.Network)
 	}
-	return argv
+	kind := "browse"
+	if label == ActLabel {
+		kind = "act"
+	}
+	return append(argv, labelArgs(kind, b.run)...)
 }
 
 // RelayArgv is how reed reaches Chromium's DevTools port: socat inside the
@@ -243,6 +255,7 @@ func (b Browser) Open(ctx context.Context, v Visit) (Page, error) {
 		return Page{}, err
 	}
 	podman := b.podman()
+	b.run = v.Labels
 	ctx, cancel := context.WithTimeout(ctx, VisitTimeout)
 	defer cancel()
 	sweepOnce.Do(func() { _ = Sweep(ctx, podman, StaleAfter) })
@@ -274,6 +287,9 @@ func (b Browser) Open(ctx context.Context, v Visit) (Page, error) {
 func (b Browser) check(v Visit, noImage string) ([]string, error) {
 	allowed, err := v.Allowlist()
 	if err != nil {
+		return nil, err
+	}
+	if err := checkLabels(v.Labels); err != nil {
 		return nil, err
 	}
 	if b.Image == "" {

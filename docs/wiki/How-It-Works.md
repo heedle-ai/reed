@@ -25,10 +25,13 @@ This is the exact command line; `TestInv_ExactPodmanCommandLines` checks it word
 ```text
 podman run -d --rm --name reed-<random> --label reed.visit --pull=never --cap-drop=all
            --security-opt=no-new-privileges --pids-limit=512 --memory=1g
-           --http-proxy=false --log-driver=none [--network=NAME] IMAGE <Chromium switches>
+           --http-proxy=false --log-driver=none [--network=NAME]
+           --label heedle.kind=browse [--label heedle.NAME=VALUE ...] IMAGE <Chromium switches>
 ```
 
 Nothing is published or mounted, and the image comes after every flag, so nothing a program says can become a Podman flag.
+
+**heedle's labels** (roadmap 9.2) come last among the flags. Every browser container carries `heedle.kind`: `browse`, or `act` for an act session. One started for a step of a run also carries `heedle.workflow`, `heedle.run` and `heedle.step`: the workflow that scheduled the step and its run, as Temporal reports them, and the step's node ID. These are bobbin's labels, with bobbin's rules, and they're how heedle finds its own containers to list, stop and clean up, never anyone else's ([bobbin → heedle's labels](https://github.com/heedle-ai/bobbin/wiki/How-It-Works#heedles-labels-and-tidying-up)). A visit sets the run labels in `Visit.Labels`, and reed sets the kind itself. The browse command fills them from Temporal's activity info (`StepLabels`), and pirn fills an act session's. A label other than the three, or a value that isn't plain printable ASCII (no spaces, quotes, commas or `=`, starting with a letter or digit, at most 255 bytes), is refused as `ErrInvalid` before Podman runs. The `reed.visit` and `reed.act` labels stay, and `Sweep` still uses them.
 
 Chromium serves its DevTools protocol only on the container's own loopback interface. reed reaches it by running socat inside the container through Podman:
 
