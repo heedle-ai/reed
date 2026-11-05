@@ -65,6 +65,18 @@ While the page loads and is read, reed captures a small JPEG every 2 seconds (`F
 
 It's for watching, not steering: the view is a picture, and there's no way to click into it. **Planned:** taking over the browser, recorded as a human step.
 
+## Act sessions
+
+[[/images/act.svg|alt=An act step, from the program to the record]]
+
+An `act` step (roadmap 9.5) gives Claude a browser to fill in forms with. reed's part is the browser; [pirn](https://github.com/heedle-ai/pirn/wiki) runs Claude's loop and records it. `Browser.Start` takes a visit like `Open` (its URL and `Allow` hosts are the allowlist, checked the same way) and starts a fresh container from the **browser-agent image**, under its own label (`reed.act`), with browse's options: nothing published or mounted, no capabilities, an unprivileged user. Its Node waits idle; no browser runs yet.
+
+`Session.Command` is Microsoft's Playwright MCP, run in that container through `podman exec` with MCP on its standard input and output (`Session.MCPArgv`). It launches the image's Chromium itself, headless, with a fresh in-memory profile, and with **the same allowlist switches as browse** as its launch arguments (`LaunchArgs`, written to Playwright's config file in the container). Playwright's own `--allowed-origins` is set too, each host on any port, but its README says it isn't a security boundary: Chromium's switches are. Page-registered tools (WebMCP) are off and downloads are refused.
+
+Playwright MCP always offers some tools no flag removes: running scripts (`browser_evaluate`, `browser_run_code_unsafe`) and uploading files (`browser_file_upload`). `ActTools` lists the ones an act step may use (reading pages and working forms), and whoever speaks to the server offers Claude only those; `TestContainer_ActServerIsPinned` checks the pinned server has each by name, and still has the others.
+
+`FrameOf` turns a screenshot into a frame like browse's live frames (half width, JPEG quality 40), refusing anything that isn't a PNG or JPEG or is too large to decode cheaply. `Session.Close` removes the container whatever state it's in; act containers older than `StaleActAfter` are swept by their own label, since an act step outlives browse's sweep.
+
 ## Errors
 
 | Situation | `Open` returns | In a program | Retried? |

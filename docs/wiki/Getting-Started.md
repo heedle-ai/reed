@@ -60,3 +60,22 @@ podman build --quiet -f context/Containerfile context
 ```
 
 To use your own image instead of the published one, give its ID to the worker: `-browser-image <image ID>` as in step 4, or after `--` with heedle (`heedle up -- -browser-image <image ID>`).
+
+## 6. A browser-agent image (for `act`)
+
+An `act` step (roadmap 9.5) fills in forms: Claude works a browser through [Playwright MCP](https://github.com/microsoft/playwright-mcp). Its image is the browser image plus Node.js (20 or later; 22 is what's published) and `@playwright/mcp` 0.0.84, exactly as `agent/package-lock.json` pins it:
+
+```bash
+(cd agent && npm ci --ignore-scripts --no-audit --no-fund)
+BUILD_IMAGE_NODE=$(dirname "$(dirname "$(command -v node)")") BUILD_IMAGE_MCP=$PWD/agent bash scripts/build-image.sh
+```
+
+`BUILD_IMAGE_NODE` is an unpacked Node.js release (the folder with `bin/node`); the script copies it and the libraries it links. The image prints its ID as before. Its container tests:
+
+```bash
+REED_ACT_IMAGE=<image ID> go test -run TestContainer_Act -v .
+```
+
+They drive Playwright MCP as Claude would (no key needed): a two-page form served by the test is filled in and submitted, and a blocked host that the page and Playwright both try to reach receives nothing.
+
+The image workflow builds and tests it beside the browser image and publishes it as `ghcr.io/heedle-ai/reed-browser-agent`. A worker takes it as `-browser-agent-image <image ID>`.
