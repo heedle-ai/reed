@@ -41,6 +41,11 @@ const (
 	ActBrowser = "/browser/chromium"
 	ActDir     = "/tmp/act" // Playwright MCP's configuration and output, inside the container
 	ActConfig  = ActDir + "/config.json"
+	// ActHold is the module Playwright MCP runs on every page it opens
+	// (its initPage), holding form submissions (HoldJS); ActSendFreely, a
+	// file, lifts the hold for a whole session (SendWithoutAsking).
+	ActHold       = ActDir + "/hold.cjs"
+	ActSendFreely = ActDir + "/send-without-asking"
 	// ActLabel marks act containers. They live as long as a step, much
 	// longer than a visit, so browse's Sweep never touches them; Start
 	// sweeps those older than StaleActAfter.
@@ -109,10 +114,11 @@ func (b Browser) Start(ctx context.Context, v Visit) (*Session, error) {
 		return nil, startError(ctx, err, out)
 	}
 	cfg, _ := json.Marshal(PlaywrightConfig(allowed, resolve))
+	files, _ := json.Marshal(map[string]string{ActConfig: string(cfg), ActHold: HoldJS})
 	put := exec.CommandContext(ctx, podman, "exec", "-i", s.name, ActNode, "-e",
-		`const fs = require("fs"); fs.mkdirSync(process.argv[1], { recursive: true }); fs.writeFileSync(process.argv[2], fs.readFileSync(0));`,
-		ActDir, ActConfig)
-	put.Env, put.Stdin = cleanEnv(), bytes.NewReader(cfg)
+		`const fs = require("fs"); fs.mkdirSync(process.argv[1], { recursive: true }); for (const [p, b] of Object.entries(JSON.parse(fs.readFileSync(0)))) fs.writeFileSync(p, b);`,
+		ActDir)
+	put.Env, put.Stdin = cleanEnv(), bytes.NewReader(files)
 	if out, err := put.CombinedOutput(); err != nil {
 		s.Close()
 		return nil, startError(ctx, err, out)
@@ -191,7 +197,8 @@ func LaunchArgs(allowed []string, resolve map[string]string) []string {
 func PlaywrightConfig(allowed []string, resolve map[string]string) map[string]any {
 	return map[string]any{"browser": map[string]any{
 		"launchOptions":  map[string]any{"args": LaunchArgs(allowed, resolve)},
-		"contextOptions": map[string]any{"acceptDownloads": false},
+		"contextOptions": map[string]any{"acceptDownloads": false, "serviceWorkers": "block"},
+		"initPage":       []string{ActHold},
 	}}
 }
 
@@ -234,6 +241,56 @@ func (s *Session) Command(ctx context.Context) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, s.podman, s.MCPArgv()...)
 	cmd.Env = cleanEnv()
 	return cmd
+}
+
+// HoldJS is the module Playwright MCP runs on each page it opens
+// (roadmap 9.7): until a person confirms, the browser sends no form. It
+// routes every request of the browser context (Playwright's own route,
+// which sees what pages, frames and their scripts send; service workers,
+// which a route can't see, are blocked) and lets through only GET, HEAD
+// and OPTIONS. Any other request, to any host, is aborted and counted,
+// unless a confirmation opened the way (ReleaseJS): then requests pass
+// until the main frame's next page loads, or 30 seconds go by, and the
+// hold is back. ActSendFreely, written before the browser starts, lifts
+// it for the session. The state lives on the browser context, which
+// only Playwright MCP's own process can reach.
+const HoldJS = `exports.default = async ({ page }) => {
+  const fs = require("fs");
+  const context = page.context();
+  let hold = context.__heedleHold;
+  if (!hold) {
+    hold = context.__heedleHold = { open: 0, used: false, held: [], heldTotal: 0 };
+    const freely = fs.existsSync(` + "`" + ActSendFreely + "`" + `);
+    await context.route("**/*", (route) => {
+      const r = route.request(), m = r.method();
+      if (m === "GET" || m === "HEAD" || m === "OPTIONS") return route.fallback();
+      if (freely || Date.now() < hold.open) { hold.used = true; return route.fallback(); }
+      hold.heldTotal++;
+      if (hold.held.length < 100) hold.held.push(m + " " + r.url().slice(0, 512));
+      return route.abort("blockedbyclient");
+    });
+  }
+  page.on("framenavigated", (frame) => {
+    if (frame === page.mainFrame() && hold.used) { hold.open = 0; hold.used = false; }
+  });
+};
+`
+
+// ReleaseJS, run by Playwright MCP's browser_run_code_unsafe (a tool no
+// model is given), opens the hold for one submission after a person
+// confirmed it. HeldJS answers the requests held so far.
+const (
+	ReleaseJS = `async (page) => { const h = page.context().__heedleHold; if (!h) throw new Error("no hold"); h.open = Date.now() + 30000; h.used = false; return "released"; }`
+	HeldJS    = `async (page) => { const h = page.context().__heedleHold; return h ? { held: h.held, total: h.heldTotal } : null; }`
+)
+
+// SendWithoutAsking lifts the hold for the whole session, for a step its
+// program let send without asking: call it before Playwright MCP starts.
+func (s *Session) SendWithoutAsking(ctx context.Context) error {
+	if out, err := podmanCmd(ctx, s.podman, "exec", s.name, ActNode, "-e", `require("fs").writeFileSync(process.argv[1], "")`, ActSendFreely); err != nil {
+		return fmt.Errorf("reed: %v: %s", err, out)
+	}
+	return nil
 }
 
 // Allowed is the session's allowlist, sorted.
