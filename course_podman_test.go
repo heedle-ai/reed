@@ -1,8 +1,11 @@
 package reed_test
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image/color"
+	"image/jpeg"
 	"io"
 	"net/http"
 	"os"
@@ -241,4 +244,101 @@ func TestContainer_ActHoldsFormsUntilConfirmed(t *testing.T) {
 	if c := check("contact"); len(c.Received) != 2 {
 		t.Fatalf("held although lifted for the session: %v", c.Received)
 	}
+}
+
+// TestContainer_ActUsesProfileWithoutShowingIt: a session given the
+// person's details (UseProfile, roadmap 9.8) types each value where the
+// model types its placeholder, so the form receives the real value; what
+// Playwright MCP answers shows the placeholder, never the value; and a
+// frame (ShotJS) masks every field holding one, and only those.
+func TestContainer_ActUsesProfileWithoutShowingIt(t *testing.T) {
+	img := testActBrowser(t)
+	network, check, _ := courseSites(t)
+	s, err := reed.Browser{Image: img, Network: network}.Start(ctx, reed.Visit{URL: "http://forms-srv:8080/contact/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	profile := map[string]string{"⟨name⟩": "Ada Lovelace", "⟨email⟩": "ada@example.org"}
+	if err := s.UseProfile(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	cs := mcpSession(t, s)
+	var seen strings.Builder
+	do := func(tool string, args map[string]any) string {
+		t.Helper()
+		out, isErr := call(t, cs, tool, args)
+		if isErr {
+			t.Fatalf("%s: %s", tool, out)
+		}
+		seen.WriteString(out)
+		return out
+	}
+	before := len(check("contact").Received)
+	do("browser_navigate", map[string]any{"url": "http://forms-srv:8080/contact/"})
+	snap := do("browser_snapshot", nil)
+	do("browser_fill_form", map[string]any{"fields": []map[string]any{
+		{"name": "Full name", "type": "textbox", "target": ref(t, snap, `textbox "Full name"`), "value": "⟨name⟩"},
+		{"name": "Email", "type": "textbox", "target": ref(t, snap, `textbox "Email"`), "value": "⟨email⟩"},
+		{"name": "Phone", "type": "textbox", "target": ref(t, snap, `textbox "Phone"`), "value": "020 7946 0018"},
+		{"name": "Message", "type": "textbox", "target": ref(t, snap, `textbox "Message"`), "value": "Please call me back."},
+	}})
+	after := do("browser_snapshot", nil)
+	for _, v := range profile {
+		if strings.Contains(seen.String(), v) {
+			t.Errorf("Playwright MCP showed %q:\n%s", v, after)
+		}
+	}
+	if !strings.Contains(after, "⟨name⟩") || !strings.Contains(after, "020 7946 0018") {
+		t.Errorf("the filled form, as the model sees it:\n%s", after)
+	}
+	// The frame: the name and email fields masked, the phone not.
+	shot := do("browser_run_code_unsafe", map[string]any{"code": reed.ShotJS})
+	b64 := result(t, shot)
+	pic, err := jpeg.Decode(base64.NewDecoder(base64.StdEncoding, strings.NewReader(b64)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	boxes := do("browser_run_code_unsafe", map[string]any{"code": `async (page) => JSON.stringify(await Promise.all(["Full name", "Email", "Phone"].map((l) => page.getByLabel(l).boundingBox())))`})
+	var rects []struct{ X, Y, Width, Height float64 }
+	if json.Unmarshal([]byte(result(t, boxes)), &rects) != nil || len(rects) != 3 {
+		t.Fatalf("boxes: %s", boxes)
+	}
+	masked := func(r struct{ X, Y, Width, Height float64 }) float64 {
+		in, all := 0, 0
+		for y := int(r.Y) + 2; y < int(r.Y+r.Height)-2; y++ {
+			for x := int(r.X) + 2; x < int(r.X+r.Width)-2; x++ {
+				c := color.RGBAModel.Convert(pic.At(x, y)).(color.RGBA)
+				all++
+				if near(c.R, 0x5b) && near(c.G, 0x5f) && near(c.B, 0x6b) {
+					in++
+				}
+			}
+		}
+		return float64(in) / float64(max(all, 1))
+	}
+	if n, e, p := masked(rects[0]), masked(rects[1]), masked(rects[2]); n < 0.9 || e < 0.9 || p > 0.2 {
+		t.Errorf("masked: name %.2f, email %.2f, phone %.2f", n, e, p)
+	}
+	// What arrives is the real value.
+	snap = do("browser_snapshot", nil)
+	do("browser_run_code_unsafe", map[string]any{"code": reed.ReleaseJS})
+	do("browser_click", map[string]any{"element": "Send", "target": ref(t, snap, `button "Send"`)})
+	do("browser_run_code_unsafe", map[string]any{"code": reed.CloseJS})
+	got := check("contact").Received
+	if len(got) != before+1 || !strings.Contains(got[len(got)-1], "name=Ada+Lovelace") || !strings.Contains(got[len(got)-1], "email=ada%40example.org") {
+		t.Errorf("received %v", got)
+	}
+}
+
+func near(a, b uint8) bool { return a >= b-12 && a <= b+12 }
+
+// result is the string a browser_run_code_unsafe call returned.
+func result(t *testing.T, out string) string {
+	t.Helper()
+	var s string
+	if i := strings.Index(out, "\""); i < 0 || json.NewDecoder(strings.NewReader(out[i:])).Decode(&s) != nil {
+		t.Fatalf("not a string result: %.300s", out)
+	}
+	return s
 }
