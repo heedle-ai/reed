@@ -101,9 +101,10 @@ type Visit struct {
 	// and is read, every FrameEvery.
 	OnFrame func(Frame)
 	// Labels are heedle's run labels for the visit's container
-	// (heedle.workflow, heedle.run, heedle.step; roadmap 9.2): reed adds
-	// heedle.kind. The browse command sets them from Temporal's activity
-	// info (StepLabels).
+	// (heedle.workflow, heedle.run, heedle.step; roadmap 9.2), and its
+	// home (heedle.home; roadmap 9.2.1): reed adds heedle.kind, and the
+	// home the context carries (WithHome) when they name none. The browse
+	// command sets them from Temporal's activity info (StepLabels).
 	Labels map[string]string
 }
 
@@ -250,6 +251,7 @@ func RelayArgv(name string) []string {
 // returning what it saw. The container is removed afterwards, whatever
 // happens.
 func (b Browser) Open(ctx context.Context, v Visit) (Page, error) {
+	v.Labels = withHome(ctx, v.Labels) // the worker's home (roadmap 9.2.1)
 	allowed, err := b.check(v, "no browser image configured (build one with scripts/build-image.sh and give the worker its ID)")
 	if err != nil {
 		return Page{}, err
