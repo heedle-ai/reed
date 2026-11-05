@@ -158,9 +158,12 @@ func TestContainer_ActFillsAForm(t *testing.T) {
 	}}); isErr {
 		t.Fatal(text)
 	}
+	// Each send waits for a confirmation (roadmap 9.7): a person's, here.
+	call(t, cs, "browser_run_code_unsafe", map[string]any{"code": reed.ReleaseJS})
 	call(t, cs, "browser_click", map[string]any{"element": "Next", "target": ref(t, snap, `button "Next"`)})
 	snap, _ = call(t, cs, "browser_snapshot", nil)
 	call(t, cs, "browser_select_option", map[string]any{"element": "Shift", "target": ref(t, snap, `combobox "Shift"`), "values": []string{"Saturday"}})
+	call(t, cs, "browser_run_code_unsafe", map[string]any{"code": reed.ReleaseJS})
 	call(t, cs, "browser_click", map[string]any{"element": "Submit", "target": ref(t, snap, `button "Submit"`)})
 	if snap, _ = call(t, cs, "browser_snapshot", nil); !strings.Contains(snap, "signed up") {
 		t.Fatalf("not submitted:\n%s", snap)
