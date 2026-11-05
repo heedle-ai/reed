@@ -382,7 +382,7 @@ func TestInv_ProfileGoesOnStandardInput(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if err := s.UseProfile(context.Background(), map[string]string{"⟨name⟩": "Ada Lovelace", "⟨email⟩": "ada@example.org"}); err != nil {
+	if err := s.UseProfile(context.Background(), map[string]string{"⟨name⟩": "Ada Lovelace", "⟨email⟩": "ada@example.org", "⟨address⟩": "Flat 2 & 3 <B>"}); err != nil {
 		t.Fatal(err)
 	}
 	log, _ := os.ReadFile(filepath.Join(dir, "log"))
@@ -393,8 +393,8 @@ func TestInv_ProfileGoesOnStandardInput(t *testing.T) {
 	b, _ := os.ReadFile(filepath.Join(dir, "stdin"))
 	dec := json.NewDecoder(bytes.NewReader(b)) // Start's files, then UseProfile's
 	dec.Decode(&files)
-	if dec.Decode(&files) != nil || files[reed.ActProfile] != `["Ada Lovelace","ada@example.org"]` ||
-		!strings.Contains(files[reed.ActConfig], `"secrets":{"⟨email⟩":"ada@example.org","⟨name⟩":"Ada Lovelace"}`) || !strings.HasPrefix(reed.ActProfile, reed.ActHoldDir+"/") {
+	if dec.Decode(&files) != nil || files[reed.ActProfile] != `["Ada Lovelace","Flat 2 & 3 <B>","ada@example.org"]` ||
+		!strings.Contains(files[reed.ActConfig], `"secrets":{"⟨address⟩":"Flat 2 & 3 <B>","⟨email⟩":"ada@example.org","⟨name⟩":"Ada Lovelace"}`) || !strings.HasPrefix(reed.ActProfile, reed.ActHoldDir+"/") {
 		t.Errorf("files written: %s", b)
 	}
 }
