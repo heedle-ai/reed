@@ -105,6 +105,7 @@ type Session struct {
 // visit) and starts a fresh browser-agent container for it, idle until
 // Playwright MCP runs in it (Command). b.Image is the browser-agent image.
 func (b Browser) Start(ctx context.Context, v Visit) (*Session, error) {
+	v.Labels = withHome(ctx, v.Labels) // the worker's home (roadmap 9.2.1)
 	allowed, err := b.check(v, "no browser-agent image configured (give the worker -browser-agent-image)")
 	if err != nil {
 		return nil, err
