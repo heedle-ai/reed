@@ -24,6 +24,7 @@ import (
 	"image"
 	stdjpeg "image/jpeg"
 	_ "image/png" // Playwright's screenshots may be PNG
+	"net"
 	"os/exec"
 	"strings"
 	"sync"
@@ -76,6 +77,11 @@ type Session struct {
 	allowed []string
 	resolve map[string]string
 	once    sync.Once
+	// stop ends Playwright MCP when SessionTimeout passes or the session
+	// is closed, whatever the caller's deadline (review 39: the bound
+	// was declared but never applied).
+	stop context.CancelFunc
+	ctx  context.Context
 }
 
 // Start validates v (its URL and Allow hosts are the allowlist, as for a
@@ -86,17 +92,22 @@ func (b Browser) Start(ctx context.Context, v Visit) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
+	resolve, err := b.pinPublic(ctx, allowed)
+	if err != nil {
+		return nil, err
+	}
 	podman := b.podman()
 	// A session lasts minutes: sweeping each time costs one podman ps.
 	_ = sweep(ctx, podman, ActLabel, StaleActAfter)
 	var rnd [6]byte
 	_, _ = rand.Read(rnd[:])
-	s := &Session{podman: podman, name: "reed-act-" + hex.EncodeToString(rnd[:]), allowed: allowed, resolve: b.Resolve}
+	sctx, stop := context.WithTimeout(context.Background(), SessionTimeout)
+	s := &Session{podman: podman, name: "reed-act-" + hex.EncodeToString(rnd[:]), allowed: allowed, resolve: resolve, ctx: sctx, stop: stop}
 	if out, err := podmanCmd(ctx, podman, b.ActArgv(s.name)...); err != nil {
 		s.Close()
 		return nil, startError(ctx, err, out)
 	}
-	cfg, _ := json.Marshal(PlaywrightConfig(allowed, b.Resolve))
+	cfg, _ := json.Marshal(PlaywrightConfig(allowed, resolve))
 	put := exec.CommandContext(ctx, podman, "exec", "-i", s.name, ActNode, "-e",
 		`const fs = require("fs"); fs.mkdirSync(process.argv[1], { recursive: true }); fs.writeFileSync(process.argv[2], fs.readFileSync(0));`,
 		ActDir, ActConfig)
@@ -106,6 +117,51 @@ func (b Browser) Start(ctx context.Context, v Visit) (*Session, error) {
 		return nil, startError(ctx, err, out)
 	}
 	return s, nil
+}
+
+// lookupIP resolves the names an act session pins (tests replace it).
+var lookupIP = net.DefaultResolver.LookupIPAddr
+
+// pinPublic is b.Resolve plus, on Podman's default network, every other
+// allowed name resolved now and pinned to its first address, each of
+// which must be public: so an allowed name's DNS can't point the browser
+// at this machine, its network or a cloud's metadata service, then or
+// later (review 39: browse only reads such a page; act could send what it
+// read). An allowed address must be public too. A named network is for
+// internal hosts by choice, as Resolve is, and is left as browse has it.
+func (b Browser) pinPublic(ctx context.Context, allowed []string) (map[string]string, error) {
+	if b.Network != "" {
+		return b.Resolve, nil
+	}
+	out := map[string]string{}
+	for h, ip := range b.Resolve {
+		out[h] = ip
+	}
+	public := func(ip net.IP) bool { return publicEnough(ip) && !ip.IsPrivate() && !ip.IsMulticast() }
+	for _, h := range allowed {
+		if ip := net.ParseIP(strings.Trim(h, "[]")); ip != nil {
+			if !public(ip) {
+				return nil, fmt.Errorf("%w: %s isn't a public address; act reaches internal hosts only on a network named for them (-browser-network)", ErrInvalid, h)
+			}
+			continue
+		}
+		if _, ok := out[h]; ok {
+			continue
+		}
+		lctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		addrs, err := lookupIP(lctx, h)
+		cancel()
+		if err != nil || len(addrs) == 0 {
+			return nil, fmt.Errorf("reed: can't resolve %s: %v", h, err)
+		}
+		for _, a := range addrs {
+			if !public(a.IP) {
+				return nil, fmt.Errorf("%w: %s resolves to %s, which isn't public; act reaches internal hosts only on a network named for them (-browser-network)", ErrInvalid, h, a.IP)
+			}
+		}
+		out[h] = addrs[0].IP.String()
+	}
+	return out, nil
 }
 
 // ActArgv is the exact podman command line for an act container, without
@@ -166,6 +222,14 @@ func (s *Session) MCPArgv() []string {
 // started: its standard input and output carry MCP. Ending it or closing
 // the session stops it.
 func (s *Session) Command(ctx context.Context) *exec.Cmd {
+	ctx, stop := context.WithCancel(ctx)
+	go func() {
+		select {
+		case <-s.ctx.Done():
+		case <-ctx.Done():
+		}
+		stop()
+	}()
 	cmd := exec.CommandContext(ctx, s.podman, s.MCPArgv()...)
 	cmd.Env = cleanEnv()
 	return cmd
@@ -178,6 +242,7 @@ func (s *Session) Allowed() []string { return append([]string(nil), s.allowed...
 // browser running, even if the caller's context is done.
 func (s *Session) Close() {
 	s.once.Do(func() {
+		s.stop()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		_, _ = podmanCmd(ctx, s.podman, "rm", "-f", "-t", "0", s.name)
