@@ -26,6 +26,7 @@ import (
 	_ "image/png" // Playwright's screenshots may be PNG
 	"net"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -49,6 +50,9 @@ const (
 	ActHoldDir    = "/tmp/act-hold"
 	ActHold       = ActHoldDir + "/hold.cjs"
 	ActSendFreely = ActHoldDir + "/send-without-asking"
+	// ActProfile lists the person's details a step may use (roadmap 9.8),
+	// for HoldJS to mask wherever a frame shows them (ShotJS).
+	ActProfile = ActHoldDir + "/profile.json"
 	// ActLabel marks act containers. They live as long as a step, much
 	// longer than a visit, so browse's Sweep never touches them; Start
 	// sweeps those older than StaleActAfter.
@@ -272,7 +276,8 @@ const HoldJS = `exports.default = async ({ page }) => {
   const context = page.context();
   let hold = context.__heedleHold;
   if (!hold) {
-    hold = context.__heedleHold = { open: 0, held: [], heldTotal: 0 };
+    hold = context.__heedleHold = { open: 0, held: [], heldTotal: 0, profile: [] };
+    try { hold.profile = JSON.parse(fs.readFileSync(` + "`" + ActProfile + "`" + `, "utf8")); } catch {}
     const freely = fs.existsSync(` + "`" + ActSendFreely + "`" + `);
     const passes = () => freely || Date.now() < hold.open;
     const held = (what) => { hold.heldTotal++; if (hold.held.length < 100) hold.held.push(what.slice(0, 520)); };
@@ -300,6 +305,58 @@ const (
 	CloseJS   = `async (page) => { const h = page.context().__heedleHold; if (h) h.open = 0; return "closed"; }`
 	HeldJS    = `async (page) => { const h = page.context().__heedleHold; return h ? { held: h.held, total: h.heldTotal } : null; }`
 )
+
+// ShotJS, run by Playwright MCP's browser_run_code_unsafe, is a JPEG
+// screenshot of the page (as base64) with every field whose value is one
+// of the person's details the step may use, and every piece of text that
+// shows one, masked by Playwright's own screenshot mask, in every frame
+// (roadmap 9.8). pirn takes frames with it when a step uses details.
+const ShotJS = `async (page) => {
+  const vals = (page.context().__heedleHold || {}).profile || [];
+  const mask = [];
+  if (vals.length) {
+    for (const frame of page.frames()) {
+      const fields = frame.locator("input, textarea, select");
+      const n = await fields.count().catch(() => 0);
+      for (let i = 0; i < n; i++) {
+        const v = await fields.nth(i).inputValue({ timeout: 1000 }).catch(() => "");
+        if (v && vals.some((p) => v.trim().toLowerCase() === p.trim().toLowerCase())) mask.push(fields.nth(i));
+      }
+      for (const p of vals) mask.push(frame.getByText(p));
+    }
+  }
+  const b = await page.screenshot({ type: "jpeg", quality: 80, scale: "css", mask, maskColor: "#5b5f6b", animations: "disabled", timeout: 10000 });
+  return b.toString("base64");
+}`
+
+// UseProfile gives the session the person's details a step may use
+// (roadmap 9.8), each under its placeholder (such as "⟨email⟩"), before
+// Playwright MCP starts: Playwright MCP's own secrets, which type the
+// value where the model types the placeholder and show the placeholder
+// wherever the value would appear in what it answers; and the values,
+// for ShotJS to mask. They go to the container on standard input, never
+// on a command line, and stay in it.
+func (s *Session) UseProfile(ctx context.Context, secrets map[string]string) error {
+	cfg := PlaywrightConfig(s.allowed, s.resolve)
+	cfg["secrets"] = secrets
+	vals := make([]string, 0, len(secrets))
+	for _, v := range secrets {
+		vals = append(vals, v)
+	}
+	sort.Strings(vals)
+	c, _ := json.Marshal(cfg)
+	p, _ := json.Marshal(vals)
+	files, _ := json.Marshal(map[string]string{ActConfig: string(c), ActProfile: string(p)})
+	put := exec.CommandContext(ctx, s.podman, "exec", "-i", s.name, ActNode, "-e",
+		`const fs = require("fs"), d = process.argv[1]; fs.chmodSync(d, 0o755); `+
+			`for (const [f, b] of Object.entries(JSON.parse(fs.readFileSync(0)))) { try { fs.chmodSync(f, 0o644); } catch {} fs.writeFileSync(f, b, { mode: 0o444 }); fs.chmodSync(f, 0o444); } fs.chmodSync(d, 0o555);`,
+		ActHoldDir)
+	put.Env, put.Stdin = cleanEnv(), bytes.NewReader(files)
+	if out, err := put.CombinedOutput(); err != nil {
+		return fmt.Errorf("reed: %v: %s", err, bytes.TrimSpace(out)) // the values went on stdin: the output never has them
+	}
+	return nil
+}
 
 // SendWithoutAsking lifts the hold for the whole session, for a step its
 // program let send without asking: call it before Playwright MCP starts.

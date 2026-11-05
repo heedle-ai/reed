@@ -368,3 +368,33 @@ func TestInv_ActBrowserOutlastsTheStep(t *testing.T) {
 		t.Errorf("SessionTimeout %v, StaleActAfter %v, a step up to %v", reed.SessionTimeout, reed.StaleActAfter, step)
 	}
 }
+
+// TestInv_ProfileGoesOnStandardInput: the person's details reach a
+// session's container only on standard input, never on a command line a
+// process listing shows: Playwright MCP's configuration with each value
+// as the secret of its placeholder, and the values for frames to mask,
+// read-only beside the hold. (Roadmap 9.8.)
+func TestInv_ProfileGoesOnStandardInput(t *testing.T) {
+	defer reed.SetLookupIP(publicDNS)()
+	dir := t.TempDir()
+	s, err := reed.Browser{Podman: fakePodman(t, dir, ""), Image: img}.Start(context.Background(), reed.Visit{URL: "https://forms.example.org/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.UseProfile(context.Background(), map[string]string{"⟨name⟩": "Ada Lovelace", "⟨email⟩": "ada@example.org"}); err != nil {
+		t.Fatal(err)
+	}
+	log, _ := os.ReadFile(filepath.Join(dir, "log"))
+	if strings.Contains(string(log), "Ada") || strings.Contains(string(log), "ada@") {
+		t.Errorf("a value on a command line:\n%s", log)
+	}
+	var files map[string]string
+	b, _ := os.ReadFile(filepath.Join(dir, "stdin"))
+	dec := json.NewDecoder(bytes.NewReader(b)) // Start's files, then UseProfile's
+	dec.Decode(&files)
+	if dec.Decode(&files) != nil || files[reed.ActProfile] != `["Ada Lovelace","ada@example.org"]` ||
+		!strings.Contains(files[reed.ActConfig], `"secrets":{"⟨email⟩":"ada@example.org","⟨name⟩":"Ada Lovelace"}`) || !strings.HasPrefix(reed.ActProfile, reed.ActHoldDir+"/") {
+		t.Errorf("files written: %s", b)
+	}
+}
