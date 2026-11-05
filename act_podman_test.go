@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"regexp"
@@ -246,6 +247,23 @@ for (const p of fs.readdirSync("/proc").filter((d) => /^\d+$/.test(d))) {
 			t.Errorf("the browser lacks %q:\n%s", a, joined)
 		}
 	}
+	// Chromium takes the last of a repeated switch: the last of each
+	// allowlist switch must be ours (review 39).
+	for _, ours := range reed.LaunchArgs(s.Allowed(), nil) {
+		key := strings.SplitN(ours, "=", 2)[0]
+		if !strings.HasPrefix(key, "--proxy") && key != "--host-resolver-rules" && !strings.HasPrefix(key, "--force-webrtc") {
+			continue
+		}
+		last := ""
+		for _, a := range browser {
+			if strings.SplitN(a, "=", 2)[0] == key {
+				last = a
+			}
+		}
+		if last != ours {
+			t.Errorf("the browser's last %s is %q, not %q", key, last, ours)
+		}
+	}
 	if strings.Contains(joined, "--remote-debugging-port") || !strings.Contains(joined, "--headless") {
 		t.Errorf("the browser has a DevTools port, or isn't headless:\n%s", joined)
 	}
@@ -265,6 +283,9 @@ for (const p of fs.readdirSync("/proc").filter((d) => /^\d+$/.test(d))) {
 // browse's sweep never removes a session that is still working.
 func TestContainer_ActSessionsAreTheirOwn(t *testing.T) {
 	img := testActBrowser(t)
+	defer reed.SetLookupIP(func(context.Context, string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("203.0.113.10")}}, nil
+	})()
 	s, err := reed.Browser{Image: img}.Start(ctx, reed.Visit{URL: "http://example.org/"})
 	if err != nil {
 		t.Fatal(err)

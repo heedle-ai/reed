@@ -8,12 +8,14 @@ import (
 	"image"
 	"image/jpeg"
 	"image/png"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/heedle-ai/reed"
 )
@@ -73,6 +75,7 @@ func contains(xs []string, x string) bool {
 // exactly these arguments, which TestContainer_ActServerIsPinned also
 // reads back from the running process. (Roadmap 9.5.)
 func TestInv_ActMCPCommandLine(t *testing.T) {
+	defer reed.SetLookupIP(publicDNS)()
 	dir := t.TempDir()
 	podman := fakePodman(t, dir, "")
 	s, err := reed.Browser{Podman: podman, Image: img}.Start(context.Background(), reed.Visit{URL: "https://forms.example.org/volunteer", Allow: []string{"cdn.example.org"}})
@@ -99,7 +102,7 @@ func TestInv_ActMCPCommandLine(t *testing.T) {
 func fakePodman(t *testing.T, dir, psJSON string) string {
 	t.Helper()
 	p := filepath.Join(dir, "podman")
-	script := "#!/bin/sh\necho \"$@\" >> " + filepath.Join(dir, "log") + "\ncat > /dev/null\ncase \"$1\" in ps) printf '%s' '" + psJSON + "' ;; esac\n"
+	script := "#!/bin/sh\necho \"$@\" >> " + filepath.Join(dir, "log") + "\ncat >> " + filepath.Join(dir, "stdin") + "\ncase \"$1\" in ps) printf '%s' '" + psJSON + "' ;; esac\n"
 	if psJSON == "" {
 		script = strings.Replace(script, "printf '%s' ''", "printf '[]'", 1)
 	}
@@ -115,6 +118,7 @@ func fakePodman(t *testing.T, dir, psJSON string) string {
 // a session working for longer than a visit may last is never removed.
 // Close removes the container. (Roadmap 9.5.)
 func TestInv_ActSessionsAreSweptOnTheirOwn(t *testing.T) {
+	defer reed.SetLookupIP(publicDNS)()
 	dir := t.TempDir()
 	old := `[{"Id":"stale1","Created":1}]`
 	podman := fakePodman(t, dir, old)
@@ -139,6 +143,7 @@ func TestInv_ActSessionsAreSweptOnTheirOwn(t *testing.T) {
 // TestInv_StartChecksAsOpenDoes: a session's visit, image and resolve
 // map are checked as a visit's are, before anything runs. (Roadmap 9.5.)
 func TestInv_StartChecksAsOpenDoes(t *testing.T) {
+	defer reed.SetLookupIP(publicDNS)()
 	dir := t.TempDir()
 	podman := fakePodman(t, dir, "")
 	for _, c := range []struct {
@@ -247,5 +252,92 @@ func TestInv_BuildImageAgentMode(t *testing.T) {
 		if b, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(b), "has no") {
 			t.Errorf("node %s mcp %s: %v\n%s", bad[0], bad[1], err, b)
 		}
+	}
+}
+
+// publicDNS answers every name with a public address (TEST-NET-3).
+func publicDNS(context.Context, string) ([]net.IPAddr, error) {
+	return []net.IPAddr{{IP: net.ParseIP("203.0.113.10")}}, nil
+}
+
+// TestInv_ActPinsPublicAddresses: on Podman's default network, an act
+// session resolves each allowed name when it starts and pins the browser
+// to that address; a name that resolves to this machine, a private
+// network, link-local (a cloud's metadata service) or nothing, or an
+// allowed address that isn't public, is refused before anything runs. On
+// a network named for internal hosts, names are left to it, as browse
+// leaves them. (Review 39: DNS could point an allowed name inward, and
+// act can send what it reads.)
+func TestInv_ActPinsPublicAddresses(t *testing.T) {
+	dns := map[string][]string{"forms.example.org": {"203.0.113.10", "2001:db8::1"}, "cdn.example.org": {"203.0.113.11"},
+		"inside.example.org": {"10.0.0.5"}, "meta.example.org": {"203.0.113.12", "169.254.169.254"}, "home.example.org": {"127.0.0.1"}, "v6.example.org": {"fd00::1"}}
+	defer reed.SetLookupIP(func(_ context.Context, h string) ([]net.IPAddr, error) {
+		var out []net.IPAddr
+		for _, a := range dns[h] {
+			out = append(out, net.IPAddr{IP: net.ParseIP(a)})
+		}
+		if out == nil {
+			return nil, errors.New("no such host")
+		}
+		return out, nil
+	})()
+	dir := t.TempDir()
+	podman := fakePodman(t, dir, "")
+	s, err := reed.Browser{Podman: podman, Image: img}.Start(context.Background(), reed.Visit{URL: "https://forms.example.org/", Allow: []string{"cdn.example.org"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	cfg, _ := os.ReadFile(filepath.Join(dir, "stdin"))
+	if !strings.Contains(string(cfg), "MAP cdn.example.org 203.0.113.11, MAP forms.example.org 203.0.113.10, MAP * ~NOTFOUND") || strings.Contains(string(cfg), "EXCLUDE") {
+		t.Errorf("the browser isn't pinned: %s", cfg)
+	}
+	for _, v := range []reed.Visit{{URL: "https://inside.example.org/"}, {URL: "https://forms.example.org/", Allow: []string{"meta.example.org"}},
+		{URL: "https://home.example.org/"}, {URL: "https://v6.example.org/"}, {URL: "http://10.1.2.3/"}, {URL: "https://forms.example.org/", Allow: []string{"192.168.1.1"}}} {
+		if _, err := (reed.Browser{Podman: podman, Image: img}).Start(context.Background(), v); !errors.Is(err, reed.ErrInvalid) {
+			t.Errorf("%+v: %v", v, err)
+		}
+	}
+	if _, err := (reed.Browser{Podman: podman, Image: img}).Start(context.Background(), reed.Visit{URL: "https://nowhere.example.org/"}); err == nil {
+		t.Error("a name that doesn't resolve started")
+	}
+	// A named network: left to it, unpinned.
+	os.Remove(filepath.Join(dir, "stdin"))
+	s, err = reed.Browser{Podman: podman, Image: img, Network: "internal"}.Start(context.Background(), reed.Visit{URL: "https://inside.example.org/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if cfg, _ := os.ReadFile(filepath.Join(dir, "stdin")); !strings.Contains(string(cfg), "EXCLUDE inside.example.org") {
+		t.Errorf("on a named network: %s", cfg)
+	}
+}
+
+// TestInv_ActSessionsEndWithClose: Playwright MCP, started with Command,
+// is stopped when the session closes (or SessionTimeout passes), whatever
+// the context it was started with. (Review 39: the bound was declared but
+// never applied.)
+func TestInv_ActSessionsEndWithClose(t *testing.T) {
+	defer reed.SetLookupIP(publicDNS)()
+	podman := fakePodman(t, t.TempDir(), "")
+	s, err := reed.Browser{Podman: podman, Image: img}.Start(context.Background(), reed.Visit{URL: "https://forms.example.org/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := s.Command(context.Background())
+	r, w, _ := os.Pipe() // standard input that never ends: the fake waits on it
+	defer w.Close()
+	cmd.Stdin = r
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	s.Close()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		cmd.Process.Kill()
+		t.Fatal("Playwright MCP kept running after the session closed")
 	}
 }
