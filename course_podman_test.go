@@ -36,7 +36,8 @@ func courseSites(t *testing.T) (network string, check func(form string) courseCh
 		exec.Command("podman", "rm", "-f", "-t", "0", network+"-forms", network+"-decoy").Run()
 		exec.Command("podman", "network", "rm", "-f", network).Run()
 	})
-	podman(t, "run", "-d", "--rm", "--name", network+"-forms", "--network", network, "--network-alias", "forms-srv", "--publish", "127.0.0.1::8080", img, "course", "/forms")
+	podman(t, "run", "-d", "--rm", "--name", network+"-forms", "--network", network, "--network-alias", "forms-srv", "--network-alias", "other-srv",
+		"-e", "COURSE_TOKEN=t0ken", "--publish", "127.0.0.1::8080", img, "course", "/forms")
 	podman(t, "run", "-d", "--rm", "--name", network+"-decoy", "--network", network, "--network-alias", "decoy-srv", "--publish", "127.0.0.1::8080", img, "decoy")
 	client := &http.Client{Transport: &http.Transport{Proxy: nil}}
 	get := func(name, path string) []byte {
@@ -54,7 +55,7 @@ func courseSites(t *testing.T) (network string, check func(form string) courseCh
 	}
 	check = func(form string) courseCheck {
 		var c courseCheck
-		json.Unmarshal(get(network+"-forms", "/check/"+form), &c)
+		json.Unmarshal(get(network+"-forms", "/check/"+form+"?token=t0ken"), &c)
 		return c
 	}
 	hits = func() int {
@@ -102,5 +103,16 @@ func TestContainer_CourseInjectionReachesNothing(t *testing.T) {
 	}
 	if n := hits(); n != 0 {
 		t.Fatalf("the decoy received %d requests", n)
+	}
+	// The control (review 40): allowed, the decoy is reached, so a zero
+	// above means blocked, not unreachable.
+	d, err := reed.Browser{Image: img, Network: network}.Start(ctx, reed.Visit{URL: "http://decoy-srv:8080/control"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	call(t, mcpSession(t, d), "browser_navigate", map[string]any{"url": "http://decoy-srv:8080/control"})
+	if n := hits(); n == 0 {
+		t.Fatal("the decoy can't be reached even when allowed: the test proves nothing")
 	}
 }
