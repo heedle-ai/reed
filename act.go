@@ -41,16 +41,23 @@ const (
 	ActBrowser = "/browser/chromium"
 	ActDir     = "/tmp/act" // Playwright MCP's configuration and output, inside the container
 	ActConfig  = ActDir + "/config.json"
-	// ActHold is the module Playwright MCP runs on every page it opens
-	// (its initPage), holding form submissions (HoldJS); ActSendFreely, a
-	// file, lifts the hold for a whole session (SendWithoutAsking).
-	ActHold       = ActDir + "/hold.cjs"
-	ActSendFreely = ActDir + "/send-without-asking"
+	// ActHoldDir holds the module Playwright MCP runs on every page it
+	// opens (its initPage), holding form submissions (HoldJS), and
+	// ActSendFreely, a file that lifts the hold for a whole session
+	// (SendWithoutAsking). It is apart from ActDir, where Playwright MCP
+	// writes, and read-only once written (review 41).
+	ActHoldDir    = "/tmp/act-hold"
+	ActHold       = ActHoldDir + "/hold.cjs"
+	ActSendFreely = ActHoldDir + "/send-without-asking"
 	// ActLabel marks act containers. They live as long as a step, much
 	// longer than a visit, so browse's Sweep never touches them; Start
 	// sweeps those older than StaleActAfter.
-	ActLabel       = "reed.act"
-	SessionTimeout = 20 * time.Minute // bounds one session, whatever the caller's deadline
+	ActLabel = "reed.act"
+	// SessionTimeout bounds one session, whatever the caller's deadline.
+	// It outlasts an act step's own bound, which includes waiting for a
+	// person to confirm each send (review 41: the browser stopped at 20
+	// minutes while a send could wait 30).
+	SessionTimeout = 3 * time.Hour
 	StaleActAfter  = SessionTimeout + 10*time.Minute
 	// FrameWidth and FrameQuality are a frame's size and JPEG quality:
 	// browse's live frames' (a half-size viewport at quality 40).
@@ -115,8 +122,9 @@ func (b Browser) Start(ctx context.Context, v Visit) (*Session, error) {
 	cfg, _ := json.Marshal(PlaywrightConfig(allowed, resolve))
 	files, _ := json.Marshal(map[string]string{ActConfig: string(cfg), ActHold: HoldJS})
 	put := exec.CommandContext(ctx, podman, "exec", "-i", s.name, ActNode, "-e",
-		`const fs = require("fs"); fs.mkdirSync(process.argv[1], { recursive: true }); for (const [p, b] of Object.entries(JSON.parse(fs.readFileSync(0)))) fs.writeFileSync(p, b);`,
-		ActDir)
+		`const fs = require("fs"); for (const d of process.argv.slice(1)) fs.mkdirSync(d, { recursive: true }); `+
+			`for (const [p, b] of Object.entries(JSON.parse(fs.readFileSync(0)))) fs.writeFileSync(p, b, { mode: 0o444 }); fs.chmodSync(process.argv[2], 0o555);`,
+		ActDir, ActHoldDir)
 	put.Env, put.Stdin = cleanEnv(), bytes.NewReader(files)
 	if out, err := put.CombinedOutput(); err != nil {
 		s.Close()
@@ -248,45 +256,57 @@ func (s *Session) Command(ctx context.Context) *exec.Cmd {
 // which sees what pages, frames and their scripts send; service workers,
 // which a route can't see, are blocked) and lets through only GET, HEAD
 // and OPTIONS. Any other request, to any host, is aborted and counted,
-// unless a confirmation opened the way (ReleaseJS): then requests pass
-// until the main frame's next page loads, or 30 seconds go by, and the
-// hold is back. ActSendFreely, written before the browser starts, lifts
-// it for the session. The state lives on the browser context, which
-// only Playwright MCP's own process can reach.
+// unless a confirmation opened the way (ReleaseJS) for the one action
+// that sends: pirn runs it just before that action and CloseJS just
+// after, and the main frame loading a page, or 30 seconds, closes it too
+// (review 41: one confirmation could send other forms). WebSockets, which
+// a route can't hold, reach their server only if opened while the way
+// is open; one opened while the hold is on never connects, and what the
+// page sends on it is counted. Forms that send with GET are
+// requests like any page load and aren't held. ActSendFreely, written
+// before the browser starts, lifts the hold for the session. The state
+// lives on the browser context, which only Playwright MCP's own process
+// can reach.
 const HoldJS = `exports.default = async ({ page }) => {
   const fs = require("fs");
   const context = page.context();
   let hold = context.__heedleHold;
   if (!hold) {
-    hold = context.__heedleHold = { open: 0, used: false, held: [], heldTotal: 0 };
+    hold = context.__heedleHold = { open: 0, held: [], heldTotal: 0 };
     const freely = fs.existsSync(` + "`" + ActSendFreely + "`" + `);
+    const passes = () => freely || Date.now() < hold.open;
+    const held = (what) => { hold.heldTotal++; if (hold.held.length < 100) hold.held.push(what.slice(0, 520)); };
     await context.route("**/*", (route) => {
       const r = route.request(), m = r.method();
-      if (m === "GET" || m === "HEAD" || m === "OPTIONS") return route.fallback();
-      if (freely || Date.now() < hold.open) { hold.used = true; return route.fallback(); }
-      hold.heldTotal++;
-      if (hold.held.length < 100) hold.held.push(m + " " + r.url().slice(0, 512));
+      if (m === "GET" || m === "HEAD" || m === "OPTIONS" || passes()) return route.fallback();
+      held(m + " " + r.url());
       return route.abort("blockedbyclient");
     });
+    await context.routeWebSocket("**/*", (ws) => {
+      if (passes()) { ws.connectToServer(); return; }
+      ws.onMessage(() => held("WS " + ws.url()));
+    });
   }
-  page.on("framenavigated", (frame) => {
-    if (frame === page.mainFrame() && hold.used) { hold.open = 0; hold.used = false; }
-  });
+  page.on("framenavigated", (frame) => { if (frame === page.mainFrame()) hold.open = 0; });
 };
 `
 
 // ReleaseJS, run by Playwright MCP's browser_run_code_unsafe (a tool no
-// model is given), opens the hold for one submission after a person
-// confirmed it. HeldJS answers the requests held so far.
+// model is given), opens the hold for the one action that sends, after a
+// person confirmed it; CloseJS closes it again once that action is done.
+// HeldJS answers the requests held so far.
 const (
-	ReleaseJS = `async (page) => { const h = page.context().__heedleHold; if (!h) throw new Error("no hold"); h.open = Date.now() + 30000; h.used = false; return "released"; }`
+	ReleaseJS = `async (page) => { const h = page.context().__heedleHold; if (!h) throw new Error("no hold"); h.open = Date.now() + 30000; return "released"; }`
+	CloseJS   = `async (page) => { const h = page.context().__heedleHold; if (h) h.open = 0; return "closed"; }`
 	HeldJS    = `async (page) => { const h = page.context().__heedleHold; return h ? { held: h.held, total: h.heldTotal } : null; }`
 )
 
 // SendWithoutAsking lifts the hold for the whole session, for a step its
 // program let send without asking: call it before Playwright MCP starts.
 func (s *Session) SendWithoutAsking(ctx context.Context) error {
-	if out, err := podmanCmd(ctx, s.podman, "exec", s.name, ActNode, "-e", `require("fs").writeFileSync(process.argv[1], "")`, ActSendFreely); err != nil {
+	if out, err := podmanCmd(ctx, s.podman, "exec", s.name, ActNode, "-e",
+		`const fs = require("fs"), d = require("path").dirname(process.argv[1]); fs.chmodSync(d, 0o755); fs.writeFileSync(process.argv[1], "", { mode: 0o444 }); fs.chmodSync(d, 0o555);`,
+		ActSendFreely); err != nil {
 		return fmt.Errorf("reed: %v: %s", err, out)
 	}
 	return nil
