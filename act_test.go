@@ -139,13 +139,19 @@ func TestInv_ActSessionsAreSweptOnTheirOwn(t *testing.T) {
 		!strings.HasPrefix(lines[4], "rm -f -t 0 reed-act-") {
 		t.Errorf("podman calls:\n%s", log)
 	}
-	if !strings.Contains(lines[3], "/node/bin/node -e ") || !strings.HasSuffix(lines[3], " /tmp/act") {
+	if !strings.Contains(lines[3], "/node/bin/node -e ") || !strings.HasSuffix(lines[3], " /tmp/act /tmp/act-hold") {
 		t.Errorf("the configuration is written as: %s", lines[3])
 	}
 	// Its files: the configuration and the hold (roadmap 9.7), each at a
 	// path of reed's, never one a program names.
 	var files map[string]string
 	b, _ := os.ReadFile(filepath.Join(dir, "stdin"))
+	// The hold sits apart from where Playwright MCP writes, read-only
+	// (review 41).
+	if strings.HasPrefix(reed.ActHold, reed.ActDir+"/") || strings.HasPrefix(reed.ActSendFreely, reed.ActDir+"/") ||
+		!strings.Contains(lines[3], "0o444") || !strings.Contains(lines[3], "0o555") {
+		t.Errorf("the hold's files can be written where Playwright MCP writes: %s, %s; %s", reed.ActHold, reed.ActSendFreely, lines[3])
+	}
 	if json.Unmarshal(b, &files) != nil || files[reed.ActHold] != reed.HoldJS || !strings.Contains(files[reed.ActConfig], reed.ActHold) || len(files) != 2 {
 		t.Errorf("files written: %s", b)
 	}
@@ -350,5 +356,15 @@ func TestInv_ActSessionsEndWithClose(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		cmd.Process.Kill()
 		t.Fatal("Playwright MCP kept running after the session closed")
+	}
+}
+
+// TestInv_ActBrowserOutlastsTheStep: an act session's browser outlasts an
+// act step waiting on every send it may (pirn: a 10-minute budget, up to
+// 5 sends each waiting up to 30 minutes, and 5 minutes' grace), and a
+// running session is never swept. (Review 41.)
+func TestInv_ActBrowserOutlastsTheStep(t *testing.T) {
+	if step := 10*time.Minute + 5*30*time.Minute + 5*time.Minute; reed.SessionTimeout <= step || reed.StaleActAfter <= reed.SessionTimeout {
+		t.Errorf("SessionTimeout %v, StaleActAfter %v, a step up to %v", reed.SessionTimeout, reed.StaleActAfter, step)
 	}
 }

