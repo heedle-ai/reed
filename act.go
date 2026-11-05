@@ -27,6 +27,7 @@ import (
 	"net"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -282,9 +283,26 @@ const HoldJS = `exports.default = async ({ page }) => {
     const freely = fs.existsSync(` + "`" + ActSendFreely + "`" + `);
     const passes = () => freely || Date.now() < hold.open;
     const held = (what) => { hold.heldTotal++; if (hold.held.length < 100) hold.held.push(what.slice(0, 520)); };
+    // A request carrying one of the person's details, in the URL or the
+    // body, plainly, encoded or as a phone number's digits, is held like
+    // a send, whatever its method (review 42: a page could read a filled
+    // field and send it with a GET).
+    const digits = (s) => s.replace(/\D/g, "");
+    const carries = (r) => {
+      if (!hold.profile.length) return false;
+      let body = "";
+      try { body = r.postData() || ""; } catch {}
+      const low = (r.url() + " " + body).toLowerCase();
+      let dec = low;
+      try { dec = decodeURIComponent(low.replace(/\+/g, " ")); } catch {}
+      return hold.profile.some((p) => {
+        const v = p.toLowerCase(), d = digits(p);
+        return low.includes(v) || dec.includes(v) || low.includes(encodeURIComponent(v)) || (d.length >= 7 && digits(low).includes(d));
+      });
+    };
     await context.route("**/*", (route) => {
       const r = route.request(), m = r.method();
-      if (m === "GET" || m === "HEAD" || m === "OPTIONS" || passes()) return route.fallback();
+      if (passes() || (m === "GET" || m === "HEAD" || m === "OPTIONS") && !carries(r)) return route.fallback();
       held(m + " " + r.url());
       return route.abort("blockedbyclient");
     });
@@ -307,28 +325,48 @@ const (
 	HeldJS    = `async (page) => { const h = page.context().__heedleHold; return h ? { held: h.held, total: h.heldTotal } : null; }`
 )
 
-// ShotJS, run by Playwright MCP's browser_run_code_unsafe, is a JPEG
-// screenshot of the page (as base64) with every field whose value is one
+// ShotJSFor's script, run by Playwright MCP's browser_run_code_unsafe, is
+// a JPEG screenshot of the page (as base64) with every field holding one
 // of the person's details the step may use, and every piece of text that
 // shows one, masked by Playwright's own screenshot mask, in every frame
-// (roadmap 9.8). pirn takes frames with it when a step uses details.
-const ShotJS = `async (page) => {
+// (roadmap 9.8). A field is matched by its letters and digits, so a value
+// the page reformats or uppercases is masked too; it is marked for the
+// mask in the same pass, so a page changing between the two can't move
+// the mask off it. pirn takes frames with it when a step uses details.
+const shotJS = `async (page) => {
   const vals = (page.context().__heedleHold || {}).profile || [];
+  if (vals.length !== WANT) throw new Error("the details to mask aren't loaded");
   const mask = [];
+  const norm = (s) => (s || "").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+  const ns = vals.map(norm).filter((v) => v.length >= 3);
   if (vals.length) {
     for (const frame of page.frames()) {
-      const fields = frame.locator("input, textarea, select");
-      const n = await fields.count().catch(() => 0);
-      for (let i = 0; i < n; i++) {
-        const v = await fields.nth(i).inputValue({ timeout: 1000 }).catch(() => "");
-        if (v && vals.some((p) => v.trim().toLowerCase() === p.trim().toLowerCase())) mask.push(fields.nth(i));
+      await frame.locator("input, textarea, select, [contenteditable]").evaluateAll((els, ns) => {
+        const norm = (s) => (s || "").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+        for (const el of els) {
+          const v = norm("value" in el ? el.value : el.textContent);
+          if (v && ns.some((n) => v.includes(n))) el.setAttribute("data-heedle-mask", "");
+        }
+      }, ns).catch(() => {});
+      mask.push(frame.locator("[data-heedle-mask]"));
+      for (const p of vals) {
+        const chars = [...p.toLowerCase()].filter((c) => /[\p{L}\p{N}]/u.test(c)).map((c) => c.replace(/[.*+?^\${}()|[\]\\]/g, "\\$&"));
+        if (chars.length >= 3) mask.push(frame.getByText(new RegExp(chars.join("[^\\p{L}\\p{N}]{0,3}"), "iu")));
       }
-      for (const p of vals) mask.push(frame.getByText(p));
     }
   }
-  const b = await page.screenshot({ type: "jpeg", quality: 80, scale: "css", mask, maskColor: "#5b5f6b", animations: "disabled", timeout: 10000 });
-  return b.toString("base64");
+  try {
+    const b = await page.screenshot({ type: "jpeg", quality: 80, scale: "css", mask, maskColor: "#5b5f6b", animations: "disabled", timeout: 10000 });
+    return b.toString("base64");
+  } finally {
+    for (const frame of page.frames()) await frame.locator("[data-heedle-mask]").evaluateAll((els) => els.forEach((e) => e.removeAttribute("data-heedle-mask"))).catch(() => {});
+  }
 }`
+
+// ShotJSFor is ShotJS for a session given n details: it fails, rather
+// than taking an unmasked frame, unless the browser has exactly n to
+// mask (review 42).
+func ShotJSFor(n int) string { return strings.Replace(shotJS, "WANT", strconv.Itoa(n), 1) }
 
 // UseProfile gives the session the person's details a step may use
 // (roadmap 9.8), each under its placeholder (such as "⟨email⟩"), before
@@ -345,9 +383,8 @@ func (s *Session) UseProfile(ctx context.Context, secrets map[string]string) err
 		vals = append(vals, v)
 	}
 	sort.Strings(vals)
-	c, _ := json.Marshal(cfg)
-	p, _ := json.Marshal(vals)
-	files, _ := json.Marshal(map[string]string{ActConfig: string(c), ActProfile: string(p)})
+	c, p := jsonText(cfg), jsonText(vals) // values exactly as given: no \u0026 for "&" (review 42)
+	files, _ := json.Marshal(map[string]string{ActConfig: c, ActProfile: p})
 	put := exec.CommandContext(ctx, s.podman, "exec", "-i", s.name, ActNode, "-e",
 		`const fs = require("fs"), d = process.argv[1]; fs.chmodSync(d, 0o755); `+
 			`for (const [f, b] of Object.entries(JSON.parse(fs.readFileSync(0)))) { try { fs.chmodSync(f, 0o644); } catch {} fs.writeFileSync(f, b, { mode: 0o444 }); fs.chmodSync(f, 0o444); } fs.chmodSync(d, 0o555);`,
@@ -414,4 +451,13 @@ func FrameOf(url string, shot []byte) (Frame, error) {
 		return Frame{}, err
 	}
 	return Frame{URL: cut(url, MaxURL), JPEG: out.Bytes()}, nil
+}
+
+// jsonText is v as JSON, without HTML escaping.
+func jsonText(v any) string {
+	var b bytes.Buffer
+	e := json.NewEncoder(&b)
+	e.SetEscapeHTML(false)
+	e.Encode(v)
+	return strings.TrimSuffix(b.String(), "\n")
 }
