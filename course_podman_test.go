@@ -93,6 +93,7 @@ func TestContainer_CourseInjectionReachesNothing(t *testing.T) {
 	}}); isErr {
 		t.Fatal(text)
 	}
+	call(t, cs, "browser_run_code_unsafe", map[string]any{"code": reed.ReleaseJS}) // a person confirmed (roadmap 9.7)
 	call(t, cs, "browser_click", map[string]any{"element": "Send feedback", "target": ref(t, snap, `button "Send feedback"`)})
 	if text, isErr := call(t, cs, "browser_navigate", map[string]any{"url": "http://decoy-srv:8080/collect"}); !isErr {
 		t.Errorf("navigating to the decoy worked:\n%s", text)
@@ -114,5 +115,67 @@ func TestContainer_CourseInjectionReachesNothing(t *testing.T) {
 	call(t, mcpSession(t, d), "browser_navigate", map[string]any{"url": "http://decoy-srv:8080/control"})
 	if n := hits(); n == 0 {
 		t.Fatal("the decoy can't be reached even when allowed: the test proves nothing")
+	}
+}
+
+// TestContainer_ActHoldsFormsUntilConfirmed: in an act session the
+// browser sends no form until a confirmation opens the way (ReleaseJS):
+// submitting the course's contact form reaches nothing and is counted as
+// held; once released, the same submission arrives; after that page
+// loads, the hold is back. Lifted for the session (SendWithoutAsking),
+// nothing is held. (Roadmap 9.7: nothing can submit the final form
+// without a confirmation.)
+func TestContainer_ActHoldsFormsUntilConfirmed(t *testing.T) {
+	img := testActBrowser(t)
+	network, check, _ := courseSites(t)
+	s, err := reed.Browser{Image: img, Network: network}.Start(ctx, reed.Visit{URL: "http://forms-srv:8080/contact/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	cs := mcpSession(t, s)
+	send := func() {
+		t.Helper()
+		call(t, cs, "browser_navigate", map[string]any{"url": "http://forms-srv:8080/contact/"})
+		snap, _ := call(t, cs, "browser_snapshot", nil)
+		call(t, cs, "browser_fill_form", map[string]any{"fields": []map[string]any{
+			{"name": "Full name", "type": "textbox", "target": ref(t, snap, `textbox "Full name"`), "value": "Ada Lovelace"},
+			{"name": "Email", "type": "textbox", "target": ref(t, snap, `textbox "Email"`), "value": "ada@example.org"},
+			{"name": "Phone", "type": "textbox", "target": ref(t, snap, `textbox "Phone"`), "value": "020 7946 0018"},
+			{"name": "Message", "type": "textbox", "target": ref(t, snap, `textbox "Message"`), "value": "Please call me back."},
+		}})
+		call(t, cs, "browser_click", map[string]any{"element": "Send", "target": ref(t, snap, `button "Send"`)})
+	}
+	send()
+	if c := check("contact"); len(c.Received) != 0 {
+		t.Fatalf("sent without a confirmation: %v", c.Received)
+	}
+	if held, _ := call(t, cs, "browser_run_code_unsafe", map[string]any{"code": reed.HeldJS}); !strings.Contains(held, `"total":1`) || !strings.Contains(held, "POST http://forms-srv:8080/contact/submit") {
+		t.Errorf("held: %s", held)
+	}
+	if out, isErr := call(t, cs, "browser_run_code_unsafe", map[string]any{"code": reed.ReleaseJS}); isErr || !strings.Contains(out, "released") {
+		t.Fatalf("release: %s", out)
+	}
+	send() // the navigation before it is a GET: the way stays open
+	if c := check("contact"); !c.Done || len(c.Received) != 1 {
+		t.Fatalf("not sent once released: %v", c.Received)
+	}
+	send() // that page loaded: held again
+	if c := check("contact"); len(c.Received) != 1 {
+		t.Fatalf("sent twice on one confirmation: %v", c.Received)
+	}
+
+	free, err := reed.Browser{Image: img, Network: network}.Start(ctx, reed.Visit{URL: "http://forms-srv:8080/contact/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer free.Close()
+	if err := free.SendWithoutAsking(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cs = mcpSession(t, free)
+	send()
+	if c := check("contact"); len(c.Received) != 2 {
+		t.Fatalf("held although lifted for the session: %v", c.Received)
 	}
 }
