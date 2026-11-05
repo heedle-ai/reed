@@ -105,7 +105,7 @@ go test -run TestInv_CourseChecksWhatArrived -v .
 REED_ACT_IMAGE=<image ID> go test -run TestContainer_Course -v .
 ```
 
-heedle runs the whole course with a stand-in Claude in CI, and scores real Claude on it when asked ([heedle → Browser agent scores](https://github.com/heedle-ai/heedle/wiki/Browser-agent-scores)).
+heedle runs the whole course with a stand-in Claude in CI, twice, so the second time each form that went through replays without Claude ([pirn → Replay without Claude](https://github.com/heedle-ai/pirn/wiki/How-It-Works#replay-without-claude), roadmap 9.9), and scores real Claude on it when asked ([heedle → Browser agent scores](https://github.com/heedle-ai/heedle/wiki/Browser-agent-scores)). A replay is only data driving Playwright MCP's own tools, so the browser's allowlist and hold apply to it unchanged.
 
 ## Errors
 
