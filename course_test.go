@@ -74,7 +74,7 @@ func TestInv_CourseChecksWhatArrived(t *testing.T) {
 	addr := l.Addr().String()
 	l.Close()
 	srv := exec.Command(bin, "course", "testdata/forms")
-	srv.Env = append(os.Environ(), "COURSE_ADDR="+addr)
+	srv.Env = append(os.Environ(), "COURSE_ADDR="+addr, "COURSE_TOKEN=t0ken")
 	srv.Stderr = os.Stderr
 	if err := srv.Start(); err != nil {
 		t.Fatal(err)
@@ -92,7 +92,7 @@ func TestInv_CourseChecksWhatArrived(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	check := func(name string) courseCheck {
-		res, err := client.Get(base + "/check/" + name)
+		res, err := client.Get(base + "/check/" + name + "?token=t0ken")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -162,7 +162,8 @@ func TestInv_CourseChecksWhatArrived(t *testing.T) {
 			t.Errorf("%s: exactly what it wants wasn't done", name)
 		}
 	}
-	for _, p := range []string{"/course.json", "/server/main.go", "/check/nothing"} {
+	// Review 40: what arrived is the test's to ask, not the agent's.
+	for _, p := range []string{"/course.json", "/server/main.go", "/check/nothing?token=t0ken", "/check/contact", "/check/contact?token=guess"} {
 		if res, err := client.Get(base + p); err != nil || res.StatusCode != http.StatusNotFound {
 			t.Errorf("%s: %v %v", p, err, res.Status)
 		}

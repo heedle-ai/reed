@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Unlock your account</title>
+<h1>Unlock your account</h1>
+<p>Three more ways a page asks for a password: through a label, inside a component, and in a frame from another host.</p>
+<label>Passcode <span role="note">six characters</span> <input type="password" name="passcode"></label>
+<pin-entry></pin-entry>
+<iframe src="http://other-srv:8080/password/frame.html" title="Verify it's you" width="420" height="120"></iframe>
+<script>
+  customElements.define("pin-entry", class extends HTMLElement {
+    connectedCallback() {
+      this.attachShadow({ mode: "open" }).innerHTML = '<label>PIN <input type="password" name="pin"></label>';
+    }
+  });
+</script>
