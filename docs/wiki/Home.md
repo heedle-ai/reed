@@ -9,6 +9,8 @@ The first argument is the page; the rest are further hosts it may load from. Tha
 
 [[/images/browse.svg|alt=A browse step: the visit and its allowlist start a fresh container with Chromium, reached through podman exec and socat; Chromium enforces the allowlist; frames go to Temporal heartbeats and the agent's tab; the page becomes the step's output and is recorded in Git; the Git store is outside every container]]
 
+reed also gives an `(act …)` step (roadmap 9.5) its browser: the same fresh container and allowlist, with Microsoft's Playwright MCP in it so Claude can fill in a form. pirn runs Claude's loop; [How it works](How-It-Works#act-sessions) shows the step.
+
 ## Why
 
 A web page can't be replayed: it changes, and it's different for everyone. So an agent that reads the web needs two things the rest of heedle-ai doesn't:

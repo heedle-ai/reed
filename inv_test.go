@@ -417,7 +417,13 @@ func TestInv_ImageIsTestedBeforeItIsPublished(t *testing.T) {
 		}
 	}
 	want := map[string][]string{
-		"build": {"id=$(podman build --quiet ", `echo "REED_IMAGE=$id" >> "$GITHUB_ENV"` + "\n"},
+		"build": {"id=$(podman build --quiet ", `echo "REED_IMAGE=$id" >> "$GITHUB_ENV"` + "\n",
+			// Roadmap 9.5: the browser-agent image, from the same run, its Node
+			// checked against the digest pinned in the workflow and its
+			// Playwright MCP exactly as the lockfile says.
+			`act=$(podman build --quiet `, `echo "REED_ACT_IMAGE=$act" >> "$GITHUB_ENV"` + "\n",
+			`echo "$NODE_SHA256  $NODE_TARBALL" | sha256sum -c -` + "\n", "npm ci --ignore-scripts",
+			"NODE_SHA256: ${{ matrix.node_sha256 }}\n"},
 		"image-tested": {
 			`REED_REQUIRE_PODMAN: "1"` + "\n",
 			"go test -count=1 -v -run 'TestContainer_' . | tee image-tested.log\n",
@@ -428,8 +434,13 @@ func TestInv_ImageIsTestedBeforeItIsPublished(t *testing.T) {
 			"grep -q -- '--- PASS: TestContainer_DevToolsIsNotExposed' image-tested.log\n",
 			"grep -q -- '--- PASS: TestContainer_OutputsAreBounded' image-tested.log\n",
 			"grep -q -- '--- PASS: TestContainer_ResolvePinsHosts' image-tested.log\n",
+			"grep -q -- '--- PASS: TestContainer_ActOnlyAllowedHostsAreReached' image-tested.log\n",
+			"grep -q -- '--- PASS: TestContainer_ActFillsAForm' image-tested.log\n",
+			"grep -q -- '--- PASS: TestContainer_ActServerIsPinned' image-tested.log\n",
+			"grep -q -- '--- PASS: TestContainer_ActSessionsAreTheirOwn' image-tested.log\n",
+			`REED_EXPECT_DEBIAN: "1"` + "\n",
 		},
-		"save":   {`"$REED_IMAGE"` + "\n"},
+		"save":   {`"$REED_IMAGE"` + "\n", `"$REED_ACT_IMAGE"` + "\n"},
 		"podman": {"--add-subuids 100000-165535 --add-subgids 100000-165535"},
 	}
 	for name, lines := range want {
@@ -473,6 +484,24 @@ func TestInv_ImageBaseIsPinned(t *testing.T) {
 	}
 	if regexp.MustCompile(`debian:[a-z]`).MatchString(strings.ReplaceAll(s, "debian:bookworm-slim's", "")) {
 		t.Error("image.yml names Debian by tag; use $DEBIAN, pinned by digest")
+	}
+	// Roadmap 9.5: Node, from nodejs.org, is pinned by version and by each
+	// architecture's digest; Playwright MCP by agent/package-lock.json.
+	if !regexp.MustCompile(`\n  NODE_VERSION: "\d+\.\d+\.\d+"\n`).MatchString(s) {
+		t.Error("image.yml: NODE_VERSION must be an exact x.y.z")
+	}
+	digests := regexp.MustCompile(`node_sha256: (\S+)`).FindAllStringSubmatch(s, -1)
+	if len(digests) != 2 {
+		t.Errorf("image.yml: want a Node digest for each architecture, got %d", len(digests))
+	}
+	for _, d := range digests {
+		if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(d[1]) {
+			t.Errorf("image.yml: Node's digest %q isn't a SHA-256", d[1])
+		}
+	}
+	lock, err := os.ReadFile("agent/package-lock.json")
+	if err != nil || !strings.Contains(string(lock), `"node_modules/@playwright/mcp": {`) || !strings.Contains(string(lock), `"integrity": "sha512-`) {
+		t.Error("agent/package-lock.json must pin @playwright/mcp with its integrity")
 	}
 }
 

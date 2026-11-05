@@ -33,11 +33,11 @@ jobs:
           - runner: ubuntu-24.04       # linux/amd64
             arch: amd64
             node: linux-x64
-            node_sha256: NODE_SHA256_X64
+            node_sha256: 680d3f30b24a7ff24b98db5e96f294c0070f8f9078df658da1bce1b9c9873c88
           - runner: ubuntu-24.04-arm   # linux/arm64, what a Mac's Podman machine runs
             arch: arm64
             node: linux-arm64
-            node_sha256: NODE_SHA256_ARM64
+            node_sha256: e660365729b434af422bcd2e8e14228637ecf24a1de2cd7c916ad48f2a0521e1
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -73,18 +73,11 @@ jobs:
             podman system migrate
           fi
           podman info --format '{{.Host.IDMappings.UIDMap}}'
-      - name: node-digests
-        run: |
-          sums=$(curl -fsSL "https://nodejs.org/dist/v$NODE_VERSION/SHASUMS256.txt")
-          for n in linux-x64 linux-arm64; do
-            echo "::notice title=node $n::$(echo "$sums" | grep " node-v$NODE_VERSION-$n.tar.xz$")"
-          done
-          echo "NODE_SHA_REAL=$(echo "$sums" | grep " node-v$NODE_VERSION-${{ matrix.node }}.tar.xz$" | cut -d' ' -f1)" >> "$GITHUB_ENV"
       - name: build
         working-directory: reed
         env:
           NODE_TARBALL: node-v${{ env.NODE_VERSION }}-${{ matrix.node }}.tar.xz
-          NODE_SHA256: ${{ env.NODE_SHA_REAL }}
+          NODE_SHA256: ${{ matrix.node_sha256 }}
         run: |
           ctx="$RUNNER_TEMP/context"
           actx="$RUNNER_TEMP/context-act"
@@ -117,7 +110,7 @@ jobs:
           echo "REED_ACT_IMAGE=$act" >> "$GITHUB_ENV"
       # The image that is published passes reed's container tests first,
       # on its own architecture; skipping fails.
-      - name: image-tested
+      - name: spike-image-tested
         working-directory: reed
         env:
           REED_REQUIRE_PODMAN: "1"
