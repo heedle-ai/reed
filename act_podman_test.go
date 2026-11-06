@@ -245,6 +245,11 @@ for (const p of fs.readdirSync("/proc").filter((d) => /^\d+$/.test(d))) {
 		t.Errorf("Playwright MCP runs as\n %q\nwant\n %q", server, want)
 	}
 	joined := strings.Join(browser, " ")
+	// Playwright's headless browser draws no scrollbars, so a frame's
+	// layout viewport is what its <iframe> shows (review 52).
+	if !strings.Contains(joined, "--hide-scrollbars") {
+		t.Errorf("the browser draws scrollbars:\n%s", joined)
+	}
 	for _, a := range reed.LaunchArgs(s.Allowed(), nil) {
 		if !strings.Contains(joined, a) {
 			t.Errorf("the browser lacks %q:\n%s", a, joined)

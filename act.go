@@ -417,8 +417,52 @@ const typedJS = `
 // every frame of the page must be reached. Sessions and worlds are kept
 // on the browser context, which only Playwright's own process reaches; on
 // any failure (a frame moved to another process, say) they are all made
-// again, once (review 52).
-const worldsJS = `const inWorlds = async (page, fn, arg, rects) => {
+// again, once (review 52). inFocus(page, fn, arg) is the focused frame's
+// answer alone, so a person's key never waits on every frame (frames
+// coming and going don't lose it). The error texts matched ("separate CDP
+// session", Playwright's; "box model" and "content quads", Chromium's)
+// are those of the image's Playwright 1.65 and Chromium 153; a change
+// fails closed. A frame's scale is its <iframe>'s content box over its
+// layout viewport, which Playwright's headless browser draws without
+// scrollbars (--hide-scrollbars), so the two measure the same.
+const worldsJS = `const heedleCall = async (ctx, t, fr, fn, arg, byValue) => {
+  const cache = ctx.__heedleWorlds;
+  const key = fr.id + "/" + fr.loaderId;
+  let id = cache.worlds.get(key);
+  if (!id) { id = (await t.s.send("Page.createIsolatedWorld", { frameId: fr.id, worldName: "heedle" })).executionContextId; cache.worlds.set(key, id); }
+  const r = await t.s.send("Runtime.callFunctionOn", { functionDeclaration: fn, executionContextId: id, arguments: [{ value: arg }], returnByValue: byValue, objectGroup: "heedle" });
+  if (r.exceptionDetails) throw new Error("a frame couldn't be read");
+  return r.result;
+};
+const inFocus = async (page, fn, arg) => {
+  // The focused frame's answer (fn answers null elsewhere): frames that
+  // can't be read are passed over, but if none answers and one couldn't
+  // be read, it may have been the focused one: an error (review 52).
+  const ctx = page.context();
+  const cache = ctx.__heedleWorlds || (ctx.__heedleWorlds = { sessions: new Map(), worlds: new Map() });
+  let failed = false;
+  const targets = [];
+  try { let s = cache.sessions.get(page); if (!s) { s = await ctx.newCDPSession(page); cache.sessions.set(page, s); } targets.push({ s }); } catch { failed = true; }
+  for (const f of page.frames()) {
+    if (f === page.mainFrame()) continue;
+    let s = cache.sessions.get(f);
+    if (!s) { try { s = await ctx.newCDPSession(f); cache.sessions.set(f, s); } catch (e) { if (!/separate CDP session/.test(String(e))) failed = true; continue; } }
+    targets.push({ s, f });
+  }
+  for (const t of targets) {
+    let tree;
+    try { tree = (await t.s.send("Page.getFrameTree")).frameTree; } catch { failed = true; if (t.f) cache.sessions.delete(t.f); else cache.sessions.delete(page); continue; }
+    const todo = [tree];
+    while (todo.length) {
+      const n = todo.pop();
+      todo.push(...(n.childFrames || []));
+      try { const v = (await heedleCall(ctx, t, n.frame, fn, arg, true)).value; if (v) return v; } catch { failed = true; cache.worlds.delete(n.frame.id + "/" + n.frame.loaderId); }
+    }
+  }
+  if (failed) throw new Error("the focused frame couldn't be read");
+  return null;
+};
+const inWorlds = async (page, fn, arg, rects) => {
   const ctx = page.context();
   const attempt = async () => {
     const cache = ctx.__heedleWorlds || (ctx.__heedleWorlds = { sessions: new Map(), worlds: new Map() });
@@ -462,20 +506,16 @@ const worldsJS = `const inWorlds = async (page, fn, arg, rects) => {
       while (todo.length) { const n = todo.pop(); if (n !== t.tree && roots.has(n.frame.id)) continue; frames.push(n.frame); todo.push(...(n.childFrames || [])); }
       reached += frames.length;
       for (const fr of frames) {
-        const key = fr.id + "/" + fr.loaderId;
-        out.docs.push(key);
-        let id = cache.worlds.get(key);
-        if (!id) { id = (await t.s.send("Page.createIsolatedWorld", { frameId: fr.id, worldName: "heedle" })).executionContextId; cache.worlds.set(key, id); }
-        const r = await t.s.send("Runtime.callFunctionOn", { functionDeclaration: fn, executionContextId: id, arguments: [{ value: arg }], returnByValue: !rects, objectGroup: "heedle" });
-        if (r.exceptionDetails) throw new Error("a frame couldn't be read");
-        if (!rects) { out.values.push(r.result.value); continue; }
+        out.docs.push(fr.id + "/" + fr.loaderId);
+        const res = await heedleCall(ctx, t, fr, fn, arg, !rects);
+        if (!rects) { out.values.push(res.value); continue; }
         if (t.map) {
           const m = t.map;
-          const { result } = await t.s.send("Runtime.getProperties", { objectId: r.result.objectId, ownProperties: true });
+          const { result } = await t.s.send("Runtime.getProperties", { objectId: res.objectId, ownProperties: true });
           for (const p of result) {
             if (!p.value || p.value.subtype !== "node") continue;
             let q;
-            try { q = await t.s.send("DOM.getContentQuads", { objectId: p.value.objectId }); } catch { continue; } // not rendered
+            try { q = await t.s.send("DOM.getContentQuads", { objectId: p.value.objectId }); } catch (e) { if (/content quads/i.test(String(e))) continue; throw e; } // not rendered: nothing shows
             for (const d of q.quads) {
               const xs = [d[0], d[2], d[4], d[6]], ys = [d[1], d[3], d[5], d[7]];
               out.rects.push([m[0] + Math.min(...xs) * m[2], m[1] + Math.min(...ys) * m[3], (Math.max(...xs) - Math.min(...xs)) * m[2], (Math.max(...ys) - Math.min(...ys)) * m[3]]);
@@ -524,7 +564,7 @@ func IsKey(key string) bool {
 // now, to what every frame masks as text too (hold.typed; review 52: a
 // page echoing what was typed showed it in frames). Nothing typed is ever
 // passed into the page's own script.
-var personField = worldsJS + fmt.Sprintf(` const probe = ((mark) => { if (!document.hasFocus()) return null; let a = document.activeElement; while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement; if (!a || a === document.body || a === document.documentElement || a.tagName === "IFRAME" || a.tagName === "FRAME") return null; if (mark) a.setAttribute("data-heedle-typed", ""); const t = a.tagName === "INPUT" ? (a.getAttribute("type") || "text").toLowerCase() : ""; const area = a.tagName === "TEXTAREA" || a.isContentEditable; const text = area || (a.tagName === "INPUT" && !["button", "submit", "reset", "checkbox", "radio", "file", "image", "color", "range", "hidden"].includes(t)); const raw = a.isContentEditable ? a.textContent : a.value; return { v: a.hasAttribute("data-heedle-typed") && typeof raw === "string" ? raw.slice(0, %[1]d) : null, pw: t === "password", text, area }; }).toString(); const field = async (mark) => (await inWorlds(page, probe, mark, false)).values.find((v) => v) || null; const keep = (f) => { const h = page.context().__heedleHold; if (h && f && !f.pw && typeof f.v === "string" && f.v.length >= 4 && !h.typed.includes(f.v) && h.typed.length < 200) h.typed.push(f.v); };`, MaxTypedValue)
+var personField = worldsJS + fmt.Sprintf(` const probe = ((mark) => { if (!document.hasFocus()) return null; let a = document.activeElement; while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement; if (!a || a === document.body || a === document.documentElement || a.tagName === "IFRAME" || a.tagName === "FRAME") return null; if (mark) a.setAttribute("data-heedle-typed", ""); const t = a.tagName === "INPUT" ? (a.getAttribute("type") || "text").toLowerCase() : ""; const area = a.tagName === "TEXTAREA" || a.isContentEditable; const text = area || (a.tagName === "INPUT" && !["button", "submit", "reset", "checkbox", "radio", "file", "image", "color", "range", "hidden"].includes(t)); const raw = a.isContentEditable ? a.textContent : a.value; return { v: a.hasAttribute("data-heedle-typed") && typeof raw === "string" ? raw.slice(0, %[1]d) : null, pw: t === "password", text, area }; }).toString(); const field = async (mark) => inFocus(page, probe, mark); const keep = (f) => { const h = page.context().__heedleHold; if (h && f && !f.pw && typeof f.v === "string" && f.v.length >= 4 && !h.typed.includes(f.v) && h.typed.length < 200) h.typed.push(f.v); };`, MaxTypedValue)
 
 // MaxTypedValue is the most of a field's value read as typed; a longer
 // value is hidden by its first MaxTypedValue characters.
@@ -645,7 +685,8 @@ const shotJS = `async (page) => {
   const after = ns.length ? await inWorlds(page, marks, ns, true) : null;
   // A document loaded, or anything that matched moved, between the two
   // readings: no frame (review 52).
-  const same = (x, y) => x.docs.slice().sort().join(" ") === y.docs.slice().sort().join(" ") && JSON.stringify(x.rects.map((r) => r.map(Math.round))) === JSON.stringify(y.rects.map((r) => r.map(Math.round)));
+  const near = (a, b) => a.length === b.length && a.every((r, i) => r.every((v, j) => Math.abs(v - b[i][j]) <= 1));
+  const same = (x, y) => x.docs.slice().sort().join(" ") === y.docs.slice().sort().join(" ") && near(x.rects, y.rects);
   if (before && !same(before, after)) throw new Error("the page changed while its frame was taken");
   return { image: b.toString("base64"), rects: before ? before.rects : [] };
 }`
