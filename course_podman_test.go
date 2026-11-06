@@ -406,6 +406,24 @@ func TestContainer_ActUsesProfileWithoutShowingIt(t *testing.T) {
 	if m := masked(rects[4]); m > 0.2 {
 		t.Errorf("other text masked %.2f", m)
 	}
+	// A frame whose document changes every 40 ms: every frame taken has
+	// the detail masked (none may be taken).
+	do("browser_run_code_unsafe", map[string]any{"code": `async (page) => { await page.setContent('<iframe id=flicker style="width:400px;height:80px;border:0"></iframe>'); await page.evaluate(() => { const f = document.getElementById("flicker"); let n = 0; setInterval(() => { f.srcdoc = '<p style="font:28px sans-serif;margin:0">Ada Lovelace ' + (n++) + '</p>'; }, 40); }); await page.waitForTimeout(300); return "flickering"; }`})
+	fast := do("browser_run_code_unsafe", map[string]any{"code": `async (page) => JSON.stringify(await page.locator("#flicker").boundingBox())`})
+	var ff struct{ X, Y, Width, Height float64 }
+	json.Unmarshal([]byte(result(t, fast)), &ff)
+	for range 6 {
+		out, isErr := call(t, cs, "browser_run_code_unsafe", map[string]any{"code": reed.ShotJSFor(2)})
+		if isErr {
+			continue
+		}
+		if pic, err = shotOf(out); err != nil {
+			t.Fatal(err)
+		}
+		if m := masked(struct{ X, Y, Width, Height float64 }{ff.X + 10, ff.Y + 10, 140, 22}); m < 0.9 {
+			t.Errorf("a fast-changing frame's detail masked %.2f", m)
+		}
+	}
 	// A frame whose document changes every 1.5 seconds, showing a detail
 	// each time:
 	// there is no frame, or the detail is masked; never an unmasked one
@@ -783,6 +801,16 @@ func TestContainer_ActMasksAcrossSites(t *testing.T) {
 	if f, m, o := masked(r), masked(e), masked(sp); f < 0.9 || m < 0.9 || o < 0.9 {
 		t.Errorf("masked across sites: the field %.2f, the echo %.2f, the text spilling out %.2f", f, m, o)
 	}
+	// A frame that can't be reached gives no frame at all: one whose
+	// DevTools session fails, and one wrongly passed over as in the page's
+	// process (review 52, round 6).
+	for _, how := range []string{"boom", "This frame does not have a separate CDP session"} {
+		run(`async (page) => { const ctx = page.context(); ctx.__heedleWorlds = null; ctx.__heedleOrig = ctx.__heedleOrig || ctx.newCDPSession.bind(ctx); ctx.newCDPSession = async (t) => { if (t !== page && t.url && t.url().startsWith("http://other-srv")) throw new Error(`+"`"+how+"`"+`); return ctx.__heedleOrig(t); }; return "broken"; }`, nil)
+		if out, isErr := call(t, cs, "browser_run_code_unsafe", map[string]any{"code": reed.ShotJSFor(0)}); !isErr {
+			t.Errorf("a frame taken with the other site's frame unreachable (%s): %.200s", how, out)
+		}
+	}
+	run(`async (page) => { const ctx = page.context(); ctx.newCDPSession = ctx.__heedleOrig; ctx.__heedleWorlds = null; return "mended"; }`, nil)
 	// The frame moves to this site's process (a sign-in going back, say):
 	// the person keeps typing, and frames are still taken (review 52,
 	// round 5: the dead session locked them out).
@@ -803,6 +831,26 @@ func TestContainer_ActMasksAcrossSites(t *testing.T) {
 		t.Errorf("after the frame moved, the field masked %.2f", f)
 	}
 	run(reed.PersonDoneJS, nil)
+	// A hidden frame from another site: frames are still taken, its
+	// unshown content boxed nowhere (review 52, round 6).
+	run(`async (page) => { await page.evaluate(() => { const i = document.createElement("iframe"); i.style.display = "none"; i.src = "http://other-srv:8080/iframe/frame.html"; document.body.append(i); }); await page.waitForTimeout(1500); return "hidden"; }`, nil)
+	if _, err := shotOf(run(reed.ShotJSFor(0), nil)); err != nil {
+		t.Errorf("with a hidden frame from another site: %v", err)
+	}
+	// Frames coming and going every 100 ms: every key the person types
+	// arrives and is read (review 52, round 6).
+	run(`async (page) => { await page.evaluate(() => { setInterval(() => { const i = document.createElement("iframe"); i.src = "http://other-srv:8080/iframe/frame.html"; i.style.width = "10px"; document.body.append(i); setTimeout(() => i.remove(), 100); }, 100); }); return "churning"; }`, nil)
+	run(reed.ClickJS(int(r.X+5), int(r.Y+5)))
+	run(`async (page) => { const f = page.frames().find((f) => f.url().startsWith("http://forms-srv:8080/iframe/frame")); await f.locator("input[name=email]").fill(""); return "cleared"; }`, nil)
+	for _, k := range strings.Split("churn@example.org", "") {
+		if out, isErr := call(t, cs, "browser_run_code_unsafe", map[string]any{"code": mustKey(t, k)}); isErr {
+			t.Fatalf("%q lost while frames came and went: %.300s", k, out)
+		}
+	}
+	if out := run(reed.KeyJS("End")); !strings.Contains(out, "churn@example.org") {
+		t.Errorf("typed while frames came and went: %s", out)
+	}
+	run(`async (page) => { await page.evaluate(() => { for (let i = 1; i < 1e5; i++) clearInterval(i); document.querySelectorAll("iframe[style*='10px']").forEach((i) => i.remove()); }); await page.waitForTimeout(300); return "still"; }`, nil)
 	// The hold, in a frame from another site in a process of its own: its
 	// fetch, its form and its WebSocket message are all held (review 52,
 	// round 5: --site-per-process).
@@ -833,4 +881,14 @@ func shotOf(answer string) (image.Image, error) {
 		return nil, err
 	}
 	return jpeg.Decode(bytes.NewReader(b))
+}
+
+// mustKey is reed.KeyJS(k), which must be a key.
+func mustKey(t *testing.T, k string) string {
+	t.Helper()
+	js, err := reed.KeyJS(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return js
 }
