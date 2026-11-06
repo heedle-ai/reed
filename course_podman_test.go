@@ -529,6 +529,49 @@ func TestContainer_ActPersonDrives(t *testing.T) {
 	if got := check("password").Received; len(got) != 2 || heldTotal() != held+1 {
 		t.Errorf("sent after the person handed back: %v, held %d then %d", got, held, heldTotal())
 	}
+	// A form in an iframe: the field inside it is marked and read, a typo
+	// fixed there too, and only the field is masked, not the frame
+	// (review 52, round 2); a character doesn't open the way, so what the
+	// page sends on a keystroke is held; text echoing what was typed is
+	// masked in frames.
+	call(t, cs, "browser_navigate", map[string]any{"url": "http://forms-srv:8080/iframe/"})
+	fboxes := run(`async (page) => { const f = page.frameLocator("iframe"); await f.getByLabel("Email").waitFor(); return JSON.stringify(await Promise.all([f.getByLabel("Email").boundingBox(), f.getByRole("button", { name: "Subscribe" }).boundingBox()])); }`, nil)
+	var frects []struct{ X, Y, Width, Height float64 }
+	if json.Unmarshal([]byte(result(t, fboxes)), &frects) != nil || len(frects) != 2 {
+		t.Fatalf("frame boxes: %s", fboxes)
+	}
+	run(reed.PersonJS, nil)
+	run(reed.ClickJS(int(frects[0].X+5), int(frects[0].Y+5)))
+	time.Sleep(reed.PersonWindow + 500*time.Millisecond)
+	held = heldTotal()
+	for _, k := range append(strings.Split("ada@example.og", ""), "ArrowLeft", "r") {
+		run(reed.KeyJS(k))
+	}
+	run(`async (page) => page.evaluate(() => fetch("/iframe/submit", { method: "POST", body: new URLSearchParams({ email: "key@example.org", frequency: "weekly" }) }).then(() => "sent", () => "held"))`, nil)
+	if n := heldTotal(); n != held+1 || len(check("iframe").Received) != 0 {
+		t.Errorf("a send while the person typed: held %d then %d, received %v", held, n, check("iframe").Received)
+	}
+	if out := run(reed.KeyJS("End")); !strings.Contains(out, `ada@example.org`) {
+		t.Errorf("the framed field's value: %s", out)
+	}
+	if typed := run(reed.TypedJS, nil); !strings.Contains(typed, `"ada@example.org"`) {
+		t.Errorf("typed in the frame: %s", typed)
+	}
+	run(`async (page) => page.evaluate(() => { const p = document.createElement("p"); p.style.font = "32px sans-serif"; p.textContent = "Signed in as ada@example.org"; document.body.prepend(p); return "shown"; })`, nil)
+	echo := run(`async (page) => JSON.stringify(await page.getByText("Signed in as").boundingBox())`, nil)
+	var erect struct{ X, Y, Width, Height float64 }
+	json.Unmarshal([]byte(result(t, echo)), &erect)
+	// The field moved down with the echo above it: measure again.
+	fboxes = run(`async (page) => { const f = page.frameLocator("iframe"); return JSON.stringify(await Promise.all([f.getByLabel("Email").boundingBox(), f.getByRole("button", { name: "Subscribe" }).boundingBox()])); }`, nil)
+	json.Unmarshal([]byte(result(t, fboxes)), &frects)
+	pic, err = jpeg.Decode(base64.NewDecoder(base64.StdEncoding, strings.NewReader(result(t, run(reed.ShotJSFor(0), nil)))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f, b, e := masked(frects[0]), masked(frects[1]), masked(erect); f < 0.9 || b > 0.2 || e < 0.9 {
+		t.Errorf("masked in the frame: typed %.2f, button %.2f; the echo %.2f", f, b, e)
+	}
+	run(reed.PersonDoneJS, nil)
 	if _, err := reed.ClickJS(reed.Width, 0); err == nil {
 		t.Error("a click off the page")
 	}

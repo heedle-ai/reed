@@ -96,7 +96,12 @@ func TestInv_ActMCPCommandLine(t *testing.T) {
 	if got := strings.Join(argv[3:], " "); got != want {
 		t.Errorf("Playwright MCP:\n got  %s\n want %s", got, want)
 	}
-	if cmd := s.Command(context.Background()); cmd.Path != podman || strings.Join(cmd.Args[1:], " ") != strings.Join(argv, " ") {
+	// Nothing of the session is saved (no --save-session, --save-trace or
+	// --save-video), and its standard error goes nowhere (review 52).
+	if strings.Contains(strings.Join(argv, " "), "--save") {
+		t.Errorf("Playwright MCP saves: %q", argv)
+	}
+	if cmd := s.Command(context.Background()); cmd.Path != podman || strings.Join(cmd.Args[1:], " ") != strings.Join(argv, " ") || cmd.Stderr != nil {
 		t.Errorf("command: %v", cmd.Args)
 	}
 }
