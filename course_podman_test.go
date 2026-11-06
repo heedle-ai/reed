@@ -434,12 +434,20 @@ func TestContainer_ActPersonDrives(t *testing.T) {
 	}
 	run(reed.PersonJS, nil)
 	run(reed.ClickJS(int(rects[0].X+5), int(rects[0].Y+5)))
-	for _, k := range strings.Split("ada@example.org", "") {
+	// A typo fixed with an arrow key: what was typed is the field's value,
+	// whatever the runs (review 52).
+	for _, k := range append(strings.Split("ada@example.og", ""), "ArrowLeft", "r") {
 		run(reed.KeyJS(k))
+	}
+	if out := run(reed.KeyJS("End")); !strings.Contains(out, `ada@example.org`) {
+		t.Errorf("the field's value: %s", out)
 	}
 	run(reed.KeyJS("Tab"))
 	for _, k := range strings.Split("hunter2", "") {
 		run(reed.KeyJS(k))
+	}
+	if typed := run(reed.TypedJS, nil); !strings.Contains(typed, `"ada@example.org"`) || !strings.Contains(typed, `"hunter2"`) {
+		t.Errorf("typed: %s", typed)
 	}
 	// The frame: the field typed into and the password field masked, the
 	// one left alone not.
@@ -465,16 +473,61 @@ func TestContainer_ActPersonDrives(t *testing.T) {
 	}
 	run(reed.KeyJS("Enter")) // the person sends it: theirs
 	time.Sleep(time.Second)
+	if got := check("password").Received; len(got) != 1 || !strings.Contains(got[0], "email=ada%40example.org") {
+		t.Errorf("sent by the person: received %v", got)
+	}
+	heldTotal := func() int {
+		var h struct{ Total int }
+		out := run(reed.HeldJS, nil)
+		if i := strings.IndexByte(out, '{'); i < 0 || json.NewDecoder(strings.NewReader(out[i:])).Decode(&h) != nil {
+			t.Fatalf("held: %s", out)
+		}
+		return h.Total
+	}
+	held := heldTotal()
+	// A WebSocket the page opens just after the person's click connects,
+	// and what it sends then is theirs; once PersonWindow has passed, the
+	// page's own sends on it, and its own fetches, are held, still during
+	// the pause (review 52: the way was open for the whole pause, and a
+	// WebSocket stayed open after it).
+	run(reed.ClickJS(5, 5))
+	if out := run(`async (page) => page.evaluate(() => new Promise((r) => { const w = new WebSocket("ws://forms-srv:8080/ws/password"); window.__w = w; w.onopen = () => { w.send("one"); r("open"); }; w.onerror = () => r("error"); }))`, nil); !strings.Contains(out, "open") {
+		t.Fatalf("websocket: %s", out)
+	}
+	time.Sleep(reed.PersonWindow + time.Second)
+	run(`async (page) => page.evaluate(() => { window.__w.send("two"); return fetch("/password/submit", { method: "POST", body: new URLSearchParams({ email: "page@example.org" }) }).then(() => "sent", () => "held"); })`, nil)
+	time.Sleep(time.Second)
+	got := check("password").Received
+	if strings.Join(got, " ") != "address=&email=ada%40example.org&password=hunter2 ws=one" {
+		t.Errorf("received during the pause: %v", got)
+	}
+	if n := heldTotal(); n != held+2 {
+		t.Errorf("held during the pause: %d, then %d", held, n)
+	}
+	// The person's hand-back fails (a dialog left open, say): the hold is
+	// on anyway, as their last input was more than PersonWindow ago.
+	call(t, cs, "browser_navigate", map[string]any{"url": "http://forms-srv:8080/password/"})
+	snap, _ := call(t, cs, "browser_snapshot", nil)
+	call(t, cs, "browser_type", map[string]any{"element": "Email", "target": ref(t, snap, `textbox "Email"`), "text": "claude@example.org"})
+	held = heldTotal()
+	call(t, cs, "browser_click", map[string]any{"element": "Sign in", "target": ref(t, snap, `button "Sign in and save"`)})
+	time.Sleep(time.Second)
+	if got := check("password").Received; len(got) != 2 || heldTotal() != held+1 {
+		t.Errorf("Claude's send with the person's hand-back failed: received %v, held %d then %d", got, held, heldTotal())
+	}
 	done := run(reed.PersonDoneJS, nil)
-	if got := check("password").Received; len(got) != 1 || !strings.Contains(got[0], "email=ada%40example.org") || !strings.Contains(done, "POST http://forms-srv:8080/password/submit") {
-		t.Errorf("sent by the person: received %v, %s", got, done)
+	if strings.Count(done, "POST http://forms-srv:8080/password/submit") != 1 || !strings.Contains(done, "WS ws://forms-srv:8080/ws/password") || strings.Contains(done, "page@example.org") {
+		t.Errorf("sent by you: %s", done)
 	}
 	// Handed back: the hold is on again.
 	call(t, cs, "browser_navigate", map[string]any{"url": "http://forms-srv:8080/password/"})
-	snap, _ := call(t, cs, "browser_snapshot", nil)
+	snap, _ = call(t, cs, "browser_snapshot", nil)
+	call(t, cs, "browser_type", map[string]any{"element": "Email", "target": ref(t, snap, `textbox "Email"`), "text": "claude@example.org"})
+	held = heldTotal()
 	call(t, cs, "browser_click", map[string]any{"element": "Sign in", "target": ref(t, snap, `button "Sign in and save"`)})
-	if got := check("password").Received; len(got) != 1 {
-		t.Errorf("sent after the person handed back: %v", got)
+	time.Sleep(time.Second)
+	if got := check("password").Received; len(got) != 2 || heldTotal() != held+1 {
+		t.Errorf("sent after the person handed back: %v, held %d then %d", got, held, heldTotal())
 	}
 	if _, err := reed.ClickJS(reed.Width, 0); err == nil {
 		t.Error("a click off the page")

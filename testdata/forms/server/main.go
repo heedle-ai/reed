@@ -2,6 +2,8 @@
 // checks what each received, or counts what reaches a decoy host:
 //
 //	server course DIR   serve the forms in DIR (testdata/forms)
+//	                    and, at GET /ws/<form>, a WebSocket whose every
+//	                    message is recorded as that form's ws=<message>
 //	server decoy        count every request; GET /hits says how many
 //
 // It listens on $COURSE_ADDR, :8080 if unset.
@@ -27,6 +29,9 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/gobwas/ws"
+	"github.com/gobwas/ws/wsutil"
 )
 
 // Form is one form of the course, as course.json describes it.
@@ -103,6 +108,27 @@ func main() {
 			mu.Unlock()
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			fmt.Fprint(w, "<!doctype html><title>Thank you</title><h1>Thank you</h1><p>We received your form.</p>")
+		})
+		http.HandleFunc("GET /ws/{form}", func(w http.ResponseWriter, r *http.Request) {
+			name := r.PathValue("form")
+			if _, ok := course[name]; !ok {
+				http.NotFound(w, r)
+				return
+			}
+			conn, _, _, err := ws.UpgradeHTTP(r, w)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			for {
+				msg, err := wsutil.ReadClientText(conn)
+				if err != nil {
+					return
+				}
+				mu.Lock()
+				got[name] = append(got[name], url.Values{"ws": {string(msg)}})
+				mu.Unlock()
+			}
 		})
 		token := os.Getenv("COURSE_TOKEN")
 		http.HandleFunc("GET /check/{form}", func(w http.ResponseWriter, r *http.Request) {

@@ -63,8 +63,9 @@ const (
 	// SessionTimeout bounds one session, whatever the caller's deadline.
 	// It outlasts an act step's own bound, which includes waiting for a
 	// person to confirm each send (review 41: the browser stopped at 20
-	// minutes while a send could wait 30).
-	SessionTimeout = 3 * time.Hour
+	// minutes while a send could wait 30) and to hand the browser back
+	// (review 52).
+	SessionTimeout = 5 * time.Hour
 	StaleActAfter  = SessionTimeout + 10*time.Minute
 	// FrameWidth and FrameQuality are a frame's size and JPEG quality:
 	// browse's live frames' (a half-size viewport at quality 40).
@@ -281,10 +282,13 @@ const HoldJS = `exports.default = async ({ page }) => {
   const context = page.context();
   let hold = context.__heedleHold;
   if (!hold) {
-    hold = context.__heedleHold = { open: 0, person: false, held: [], heldTotal: 0, byYou: [], byYouTotal: 0, profile: [] };
+    hold = context.__heedleHold = { open: 0, person: 0, held: [], heldTotal: 0, byYou: [], byYouTotal: 0, profile: [] };
     try { hold.profile = JSON.parse(fs.readFileSync(` + "`" + ActProfile + "`" + `, "utf8")); } catch {}
     const freely = fs.existsSync(` + "`" + ActSendFreely + "`" + `);
-    const passes = () => freely || hold.person || Date.now() < hold.open;
+    // A person's input (ClickJS, KeyJS) opens the way for PersonWindow
+    // from that input, never the whole pause (review 52).
+    const yours = () => Date.now() < hold.person;
+    const passes = () => freely || yours() || Date.now() < hold.open;
     const held = (what) => { hold.heldTotal++; if (hold.held.length < 100) hold.held.push(what.slice(0, 520)); };
     // What a person sends while they drive (PersonJS) is theirs, and is
     // counted as sent by them (roadmap 9.10).
@@ -309,14 +313,24 @@ const HoldJS = `exports.default = async ({ page }) => {
     await context.route("**/*", (route) => {
       const r = route.request(), m = r.method();
       const sends = !(m === "GET" || m === "HEAD" || m === "OPTIONS") || carries(r);
-      if (passes()) { if (hold.person && sends) byYou(m + " " + r.url()); return route.fallback(); }
+      if (passes()) { if (yours() && sends) byYou(m + " " + r.url()); return route.fallback(); }
       if (!sends) return route.fallback();
       held(m + " " + r.url());
       return route.abort("blockedbyclient");
     });
+    // A WebSocket opened while the way is open connects, but each message
+    // the page sends on it is let through only while the way is open still
+    // (review 52: one opened by a confirmed action, or while a person
+    // drove, stayed open after).
     await context.routeWebSocket("**/*", (ws) => {
-      if (passes()) { if (hold.person) byYou("WS " + ws.url()); ws.connectToServer(); return; }
-      ws.onMessage(() => held("WS " + ws.url()));
+      if (!passes()) { ws.onMessage(() => held("WS " + ws.url())); return; }
+      const server = ws.connectToServer();
+      if (freely) return;
+      ws.onMessage((m) => {
+        if (!passes()) return held("WS " + ws.url());
+        if (yours()) byYou("WS " + ws.url());
+        server.send(m);
+      });
     });
   }
   page.on("framenavigated", (frame) => { if (frame === page.mainFrame()) hold.open = 0; });
@@ -334,13 +348,46 @@ const (
 )
 
 // PersonJS, run by Playwright MCP's browser_run_code_unsafe (a tool no
-// model is given), hands the browser to a person (roadmap 9.10): the hold
-// lets what they send through, and counts it as sent by them, until
-// PersonDoneJS hands it back, which answers what they sent.
+// model is given), hands the browser to a person (roadmap 9.10): from then
+// on each of their inputs (ClickJS, KeyJS) lets what is sent within
+// PersonWindow of it through, counted as sent by them. PersonDoneJS hands
+// it back, closing the way at once, and answers what they sent. The way
+// is never open longer than PersonWindow after their last input, so a
+// PersonDoneJS that fails (a dialog left open) leaves the hold on anyway
+// (review 52).
 const (
-	PersonJS     = `async (page) => { const h = page.context().__heedleHold; if (!h) throw new Error("no hold"); h.person = true; h.byYou = []; h.byYouTotal = 0; return "yours"; }`
-	PersonDoneJS = `async (page) => { const h = page.context().__heedleHold; if (!h) return null; h.person = false; return { sent: h.byYou, total: h.byYouTotal }; }`
+	PersonJS     = `async (page) => { const h = page.context().__heedleHold; if (!h) throw new Error("no hold"); h.person = 0; h.byYou = []; h.byYouTotal = 0; return "yours"; }`
+	PersonDoneJS = `async (page) => { const h = page.context().__heedleHold; if (!h) return null; h.person = 0; return { sent: h.byYou, total: h.byYouTotal }; }`
 )
+
+// PersonWindow is how long after a person's input what the page sends is
+// theirs.
+const PersonWindow = 3 * time.Second
+
+// personInput opens the way for a person's input (ClickJS, KeyJS).
+var personInput = fmt.Sprintf(`const h = page.context().__heedleHold; if (!h) throw new Error("no hold"); h.person = Date.now() + %d;`, PersonWindow.Milliseconds())
+
+// TypedJS, run by Playwright MCP's browser_run_code_unsafe at hand-back,
+// answers the values of every field a person typed into (KeyJS marks them)
+// and every password field, in every frame and open shadow root, so pirn
+// can hide them, in memory only, however they were typed (review 52: a
+// typo fixed with an arrow key split what was typed).
+const TypedJS = `async (page) => {
+  const values = [];
+  for (const f of page.frames()) {
+    const vs = await f.evaluate(() => {
+      const out = [];
+      const walk = (root) => {
+        for (const e of root.querySelectorAll("[data-heedle-typed], input[type=password i]")) if (typeof e.value === "string" && e.value) out.push(e.value.slice(0, 1024));
+        for (const e of root.querySelectorAll("*")) if (e.shadowRoot) walk(e.shadowRoot);
+      };
+      walk(document);
+      return out;
+    }).catch(() => []);
+    for (const v of vs) if (values.length < 200) values.push(v);
+  }
+  return { values };
+}`
 
 // keys are the named keys a person may press while driving; any other
 // key is one printable character, typed.
@@ -358,8 +405,9 @@ func IsKey(key string) bool {
 }
 
 // markTyped marks the field a person is typing into, in whichever frame
-// has the focus, so every later frame masks it (ShotJSFor).
-const markTyped = `for (const f of page.frames()) { await f.evaluate(() => { if (!document.hasFocus()) return; let a = document.activeElement; while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement; if (a && a !== document.body && a !== document.documentElement) a.setAttribute("data-heedle-typed", ""); }).catch(() => {}); }`
+// has the focus, so every later frame masks it (ShotJSFor), and is its
+// value (at most 1024 characters), or null.
+const markTyped = `(async () => { for (const f of page.frames()) { const v = await f.evaluate(() => { if (!document.hasFocus()) return null; let a = document.activeElement; while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement; if (!a || a === document.body || a === document.documentElement) return null; a.setAttribute("data-heedle-typed", ""); return typeof a.value === "string" ? a.value.slice(0, 1024) : ""; }).catch(() => null); if (v !== null) return v; } return null; })()`
 
 // ClickJS is a person's click at (x, y) on the page, in CSS pixels of the
 // viewport, as DevTools input events (Playwright's mouse) (roadmap 9.10).
@@ -367,12 +415,15 @@ func ClickJS(x, y int) (string, error) {
 	if x < 0 || y < 0 || x >= Width || y >= Height {
 		return "", fmt.Errorf("%w: a click at %d,%d is off the page", ErrInvalid, x, y)
 	}
-	return fmt.Sprintf("async (page) => { await page.mouse.click(%d, %d); return \"clicked\"; }", x, y), nil
+	return fmt.Sprintf("async (page) => { %s await page.mouse.click(%d, %d); return \"clicked\"; }", personInput, x, y), nil
 }
 
 // KeyJS is a person's key press (IsKey) as DevTools input events
 // (Playwright's keyboard): a named key is pressed, a character typed, and
-// the field it goes to is marked to be masked in every later frame.
+// the field it goes to is marked to be masked in every later frame. It
+// answers {before, after}: the focused field's value before and after the
+// key, so pirn can hide what a field holds however it was typed (review
+// 52: a typo fixed with an arrow key split what was typed).
 func KeyJS(key string) (string, error) {
 	if !IsKey(key) {
 		return "", fmt.Errorf("%w: not a key a person may press here", ErrInvalid)
@@ -382,7 +433,10 @@ func KeyJS(key string) (string, error) {
 	if keys[key] {
 		do = "await page.keyboard.press(" + k + ");"
 	}
-	return "async (page) => { " + do + " " + markTyped + " return \"pressed\"; }", nil
+	// The field is marked before the key too, so a key that moves focus
+	// (a code box that moves on by itself) leaves its field marked
+	// (review 52).
+	return "async (page) => { " + personInput + " const before = await " + markTyped + "; " + do + " const after = await " + markTyped + "; return { before, after }; }", nil
 }
 
 // ShotJSFor's script, run by Playwright MCP's browser_run_code_unsafe, is

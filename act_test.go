@@ -364,7 +364,7 @@ func TestInv_ActSessionsEndWithClose(t *testing.T) {
 // 5 sends each waiting up to 30 minutes, and 5 minutes' grace), and a
 // running session is never swept. (Review 41.)
 func TestInv_ActBrowserOutlastsTheStep(t *testing.T) {
-	if step := 10*time.Minute + 5*30*time.Minute + 5*time.Minute; reed.SessionTimeout <= step || reed.StaleActAfter <= reed.SessionTimeout {
+	if step := 10*time.Minute + (5+3)*30*time.Minute + 5*time.Minute; reed.SessionTimeout <= step || reed.StaleActAfter <= reed.SessionTimeout {
 		t.Errorf("SessionTimeout %v, StaleActAfter %v, a step up to %v", reed.SessionTimeout, reed.StaleActAfter, step)
 	}
 }
