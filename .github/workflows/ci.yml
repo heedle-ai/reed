@@ -89,3 +89,4 @@ jobs:
           grep -q -- '--- PASS: TestContainer_CourseInjectionReachesNothing' containers.log
           grep -q -- '--- PASS: TestContainer_ActHoldsFormsUntilConfirmed' containers.log
           grep -q -- '--- PASS: TestContainer_ActPersonDrives' containers.log
+          grep -q -- '--- PASS: TestContainer_ActMasksAcrossSites' containers.log

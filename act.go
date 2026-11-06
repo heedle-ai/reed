@@ -375,21 +375,21 @@ var personInput = fmt.Sprintf(`const h = page.context().__heedleHold; if (!h) th
 var TypedJS = strings.Replace(typedJS, "MAX", strconv.Itoa(MaxTypedValue), 1)
 
 const typedJS = `async (page) => {
-  const values = [];
+  const values = [], kept = [];
   for (const f of page.frames()) {
     const vs = await f.evaluate(() => {
       const out = [];
       const walk = (root) => {
-        for (const e of root.querySelectorAll("[data-heedle-typed], input[type=password i]")) { const v = e.isContentEditable ? e.textContent : e.value; if (typeof v === "string" && v) out.push(v.slice(0, MAX)); }
+        for (const e of root.querySelectorAll("[data-heedle-typed], input[type=password i]")) { const v = e.isContentEditable ? e.textContent : e.value; if (typeof v === "string" && v) out.push({ v: v.slice(0, MAX), pw: e.tagName === "INPUT" && (e.getAttribute("type") || "").toLowerCase() === "password" }); }
         for (const e of root.querySelectorAll("*")) if (e.shadowRoot) walk(e.shadowRoot);
       };
       walk(document);
       return out;
     }).catch(() => []);
-    for (const v of vs) if (values.length < 200) values.push(v);
+    for (const x of vs) if (values.length < 200) { values.push(x.v); if (!x.pw) kept.push(x.v); }
   }
   const h = page.context().__heedleHold;
-  if (h) for (const v of values) if (v.length >= 4 && !h.typed.includes(v) && h.typed.length < 200) h.typed.push(v);
+  if (h) for (const v of kept) if (v.length >= 4 && !h.typed.includes(v) && h.typed.length < 200) h.typed.push(v);
   return { values };
 }`
 
@@ -411,12 +411,16 @@ func IsKey(key string) bool {
 // personField defines, in a person's input's script, field(mark): the
 // focused field, in whichever frame or open shadow root has the focus
 // (never a frame's <iframe> element: the field inside it), marked as
-// typed into if mark, and its value (a contenteditable's text, at most
-// MaxTypedValue characters) if it is marked, "" if not, or null with no
-// field focused; and keep(v), which adds v, if at least four characters,
-// to what every frame masks as text too (hold.typed; review 52: a page
-// echoing what was typed showed it in frames).
-var personField = fmt.Sprintf(`const field = async (mark) => { for (const f of page.frames()) { const v = await f.evaluate((mark) => { if (!document.hasFocus()) return null; let a = document.activeElement; while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement; if (!a || a === document.body || a === document.documentElement || a.tagName === "IFRAME" || a.tagName === "FRAME") return null; if (mark) a.setAttribute("data-heedle-typed", ""); if (!a.hasAttribute("data-heedle-typed")) return ""; const v = a.isContentEditable ? a.textContent : a.value; return typeof v === "string" ? v.slice(0, %[1]d) : ""; }, mark).catch(() => null); if (v !== null) return v; } return null; }; const keep = (v) => { const h = page.context().__heedleHold; if (h && typeof v === "string" && v.length >= 4 && !h.typed.includes(v) && h.typed.length < 200) h.typed.push(v); };`, MaxTypedValue)
+// typed into if mark, as {v, pw, text, area}: its value (a
+// contenteditable's text, at most MaxTypedValue characters) if it is
+// marked, else null; whether it is a password field; whether it takes
+// text; and whether Enter makes a new line in it (a textarea, a
+// contenteditable). It is null with no field focused. keep(f) adds f's
+// value, if at least four characters and not a password (a password
+// field is masked as a field), to what every frame masks as text too
+// (hold.typed; review 52: a page echoing what was typed showed it in
+// frames). Nothing typed is ever passed into the page's script.
+var personField = fmt.Sprintf(`const field = async (mark) => { for (const f of page.frames()) { const v = await f.evaluate((mark) => { if (!document.hasFocus()) return null; let a = document.activeElement; while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement; if (!a || a === document.body || a === document.documentElement || a.tagName === "IFRAME" || a.tagName === "FRAME") return null; if (mark) a.setAttribute("data-heedle-typed", ""); const t = a.tagName === "INPUT" ? (a.getAttribute("type") || "text").toLowerCase() : ""; const area = a.tagName === "TEXTAREA" || a.isContentEditable; const text = area || (a.tagName === "INPUT" && !["button", "submit", "reset", "checkbox", "radio", "file", "image", "color", "range", "hidden"].includes(t)); const raw = a.isContentEditable ? a.textContent : a.value; return { v: a.hasAttribute("data-heedle-typed") && typeof raw === "string" ? raw.slice(0, %[1]d) : null, pw: t === "password", text, area }; }, mark).catch(() => null); if (v !== null) return v; } return null; }; const keep = (f) => { const h = page.context().__heedleHold; if (h && f && !f.pw && typeof f.v === "string" && f.v.length >= 4 && !h.typed.includes(f.v) && h.typed.length < 200) h.typed.push(f.v); };`, MaxTypedValue)
 
 // MaxTypedValue is the most of a field's value read as typed; a longer
 // value is hidden by its first MaxTypedValue characters.
@@ -442,9 +446,11 @@ func ClickJS(x, y int) (string, error) {
 // {before, after}: the focused field's value before and after the key if
 // it is one typed into, so pirn hides what a field holds however it was
 // typed (review 52: a typo fixed with an arrow key split what was typed).
-// Only Enter and Space, which may send, open the way for PersonWindow
-// (review 52: every keystroke opened it, so a page sending on each key
-// passed as you).
+// Only a key that may send opens the way for PersonWindow (review 52:
+// every keystroke opened it, so a page sending on each key passed as
+// you): Enter, except where it makes a new line (a textarea, a
+// contenteditable), and Space where it doesn't type (a button, a
+// checkbox), as the focused element decides.
 func KeyJS(key string) (string, error) {
 	if !IsKey(key) {
 		return "", fmt.Errorf("%w: not a key a person may press here", ErrInvalid)
@@ -454,57 +460,93 @@ func KeyJS(key string) (string, error) {
 	if keys[key] {
 		do = "await page.keyboard.press(" + k + ");"
 	}
-	open := `const h = page.context().__heedleHold; if (!h) throw new Error("no hold");`
-	if key == "Enter" || key == " " {
-		open = personInput
+	open := ""
+	switch key {
+	case "Enter":
+		open = "if (!(before && before.area)) { " + personInput + " }"
+	case " ":
+		open = "if (!(before && before.text)) { " + personInput + " }"
 	}
-	edits := !keys[key] || key == "Backspace" || key == "Delete"
 	mark, leave := "false", ""
-	if edits {
+	if !keys[key] || key == "Backspace" || key == "Delete" {
 		mark = "true"
 	}
 	if key == "Tab" || key == "Shift+Tab" || key == "Enter" || key == "Escape" {
 		leave = "keep(before);"
 	}
-	return "async (page) => { " + open + " " + personField + " const before = await field(" + mark + "); " + leave + " " + do + " const after = await field(" + mark + "); return { before, after }; }", nil
+	return "async (page) => { if (!page.context().__heedleHold) throw new Error(\"no hold\"); " + personField + " const before = await field(" + mark + "); " + open + " " + leave + " " + do +
+		" const after = await field(" + mark + "); return { before: before && before.v, after: after && after.v }; }", nil
 }
 
 // ShotJSFor's script, run by Playwright MCP's browser_run_code_unsafe, is
 // a JPEG screenshot of the page (as base64) with every field holding one
-// of the person's details the step may use, and every piece of text that
+// of the person's details the step may use, and every element whose text
 // shows one, masked by Playwright's own screenshot mask, in every frame
-// (roadmap 9.8). A field is matched by its letters and digits, so a value
-// the page reformats or uppercases is masked too; it is marked for the
-// mask in the same pass, so a page changing between the two can't move
+// (roadmap 9.8). A value is matched by its letters and digits, so one the
+// page reformats, spaces out or uppercases is masked too; it is marked for
+// the mask in the same pass, so a page changing between the two can't move
 // the mask off it. Password fields, and every field a person typed into
-// while driving (KeyJS marks them), are masked in every frame too
-// (roadmap 9.10). pirn takes every act frame with it.
+// while driving (KeyJS marks them), are masked in every frame too, and
+// what they typed (hold.typed) wherever the page shows it as text (roadmap
+// 9.10). The matching runs in a world of its own (DevTools' isolated
+// world, one per process the page's frames run in), never the page's: a
+// page that replaces its String or RegExp methods sees none of the values
+// (review 52: they were passed into the page's own script). pirn takes
+// every act frame with it.
 const shotJS = `async (page) => {
   const hold = page.context().__heedleHold || {};
   const details = hold.profile || [];
   if (details.length !== WANT) throw new Error("the details to mask aren't loaded");
-  // What a person typed while driving is masked as text too (review 52).
-  const vals = details.concat((hold.typed || []).filter((v) => v.length >= 4));
-  const mask = [];
-  // Password fields, and fields a person typed into while driving, are
-  // masked in every frame, whatever the step uses (roadmap 9.10).
-  for (const frame of page.frames()) mask.push(frame.locator('input[type="password" i], [data-heedle-typed]'));
   const norm = (s) => (s || "").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
-  const ns = vals.map(norm).filter((v) => v.length >= 3);
-  if (vals.length) {
-    for (const frame of page.frames()) {
-      await frame.locator("input, textarea, select, [contenteditable]").evaluateAll((els, ns) => {
-        const norm = (s) => (s || "").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
-        for (const el of els) {
-          const v = norm("value" in el ? el.value : el.textContent);
-          if (v && ns.some((n) => v.includes(n))) el.setAttribute("data-heedle-mask", "");
-        }
-      }, ns).catch(() => {});
-      mask.push(frame.locator("[data-heedle-mask]"));
-      for (const p of vals) {
-        const chars = [...p.toLowerCase()].filter((c) => /[\p{L}\p{N}]/u.test(c)).map((c) => c.replace(/[.*+?^\${}()|[\]\\]/g, "\\$&"));
-        if (chars.length >= 3) mask.push(frame.getByText(new RegExp(chars.join("[^\\p{L}\\p{N}]{0,3}"), "iu")));
+  const ns = details.concat((hold.typed || []).filter((v) => v.length >= 4)).map(norm).filter((v) => v.length >= 3);
+  const mask = [];
+  for (const frame of page.frames()) mask.push(frame.locator('input[type="password" i], [data-heedle-typed], [data-heedle-mask]'));
+  // Marks each field holding a value, and each smallest element whose
+  // text shows one, in a frame's document and its open shadow roots. It
+  // runs in the frame's isolated world.
+  const marks = ((ns) => {
+    const norm = (s) => (s || "").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+    const has = (s) => { const v = norm(s); return v !== "" && ns.some((n) => v.includes(n)); };
+    const roots = [document];
+    while (roots.length) {
+      const root = roots.pop();
+      const els = [...root.querySelectorAll("*")];
+      const shows = new Set(els.filter((el) => !["SCRIPT", "STYLE", "TEMPLATE"].includes(el.tagName) && has(el.textContent)));
+      for (const el of els) {
+        if (el.shadowRoot) roots.push(el.shadowRoot);
+        const field = el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable;
+        if (field && has("value" in el ? el.value : el.textContent)) el.setAttribute("data-heedle-mask", "");
+        else if (shows.has(el) && ![...el.children].some((c) => shows.has(c))) el.setAttribute("data-heedle-mask", "");
       }
+    }
+    return "marked";
+  }).toString();
+  // Every frame of a DevTools session (a process's frames), each in an
+  // isolated world of its own; any that fails, fails the frame.
+  const isolated = async (target) => {
+    const s = await page.context().newCDPSession(target);
+    try {
+      const { frameTree } = await s.send("Page.getFrameTree");
+      const ids = [], tree = [frameTree];
+      while (tree.length) { const t = tree.pop(); ids.push(t.frame.id); tree.push(...(t.childFrames || [])); }
+      for (const frameId of ids) {
+        const { executionContextId } = await s.send("Page.createIsolatedWorld", { frameId, worldName: "heedle-mask" });
+        const r = await s.send("Runtime.callFunctionOn", { functionDeclaration: marks, executionContextId, arguments: [{ value: ns }], returnByValue: true });
+        if (r.exceptionDetails || !r.result || r.result.value !== "marked") throw new Error("the details couldn't be marked");
+      }
+    } finally {
+      await s.detach().catch(() => {});
+    }
+  };
+  if (ns.length) {
+    await isolated(page);
+    // Frames in a process of their own (another site's) have a DevTools
+    // session of their own; the others were reached from the page.
+    for (const f of page.frames()) {
+      if (f === page.mainFrame()) continue;
+      let own = true;
+      try { await (await page.context().newCDPSession(f)).detach(); } catch { own = false; }
+      if (own) await isolated(f);
     }
   }
   try {
