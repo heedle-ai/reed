@@ -28,6 +28,7 @@ import (
 	_ "image/png" // Playwright's screenshots may be PNG
 	"net"
 	"os/exec"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -61,6 +62,9 @@ const (
 	// ActStorage is a saved sign-in's storage state, which the browser
 	// starts with (roadmap 9.11), beside the hold, read-only.
 	ActStorage = ActHoldDir + "/storage.json"
+	// ActSignedIn are the hosts a session starts signed in on and the
+	// values their sign-ins hold, for the hold (roadmap 9.11, review 53).
+	ActSignedIn = ActHoldDir + "/signed-in.json"
 	// ActLabel marks act containers. They live as long as a step, much
 	// longer than a visit, so browse's Sweep never touches them; Start
 	// sweeps those older than StaleActAfter.
@@ -103,6 +107,7 @@ type Session struct {
 	resolve map[string]string
 	secrets map[string]string // UseProfile's, kept to write the config again
 	storage []byte            // UseStorage's
+	signed  []string          // UseStorage's hosts
 	once    sync.Once
 	// stop ends Playwright MCP when SessionTimeout passes or the session
 	// is closed, whatever the caller's deadline (review 39: the bound
@@ -295,6 +300,13 @@ const HoldJS = `exports.default = async ({ page }) => {
   if (!hold) {
     hold = context.__heedleHold = { open: 0, person: 0, held: [], heldTotal: 0, byYou: [], byYouTotal: 0, profile: [], typed: [] };
     try { hold.profile = JSON.parse(fs.readFileSync(` + "`" + ActProfile + "`" + `, "utf8")); } catch {}
+    // Signed in as the person (roadmap 9.11): what the sign-ins hold is
+    // held like a detail wherever a request carries it, and masked in
+    // frames; and a GET with a query to a host not signed in is held, so
+    // another allowed host can't carry off what a signed-in page showed
+    // (review 53).
+    hold.signed = []; hold.secret = [];
+    try { const s = JSON.parse(fs.readFileSync(` + "`" + ActSignedIn + "`" + `, "utf8")); hold.signed = s.hosts; hold.secret = s.values; hold.typed.push(...s.values); } catch {}
     const freely = fs.existsSync(` + "`" + ActSendFreely + "`" + `);
     // A person's input (ClickJS, KeyJS) opens the way for PersonWindow
     // from that input, never the whole pause (review 52).
@@ -310,20 +322,23 @@ const HoldJS = `exports.default = async ({ page }) => {
     // field and send it with a GET).
     const digits = (s) => s.replace(/\D/g, "");
     const carries = (r) => {
-      if (!hold.profile.length) return false;
+      const values = hold.profile.concat(hold.secret);
+      if (!values.length) return false;
       let body = "";
       try { body = r.postData() || ""; } catch {}
       const low = (r.url() + " " + body).toLowerCase();
       let dec = low;
       try { dec = decodeURIComponent(low.replace(/\+/g, " ")); } catch {}
-      return hold.profile.some((p) => {
+      return values.some((p) => {
         const v = p.toLowerCase(), d = digits(p);
         return low.includes(v) || dec.includes(v) || low.includes(encodeURIComponent(v)) || (d.length >= 7 && digits(low).includes(d));
       });
     };
     await context.route("**/*", (route) => {
       const r = route.request(), m = r.method();
-      const sends = !(m === "GET" || m === "HEAD" || m === "OPTIONS") || carries(r);
+      let off = false;
+      if (hold.signed.length && m === "GET") { try { const u = new URL(r.url()); off = u.search !== "" && !hold.signed.includes(u.hostname); } catch {} }
+      const sends = !(m === "GET" || m === "HEAD" || m === "OPTIONS") || carries(r) || off;
       if (passes()) { if (yours() && sends) byYou(m + " " + r.url()); return route.fallback(); }
       if (!sends) return route.fallback();
       held(m + " " + r.url());
@@ -359,6 +374,9 @@ const (
 	CloseJS   = `async (page) => { const h = page.context().__heedleHold; if (h) h.open = 0; return "closed"; }`
 	HeldJS    = `async (page) => { const h = page.context().__heedleHold; return h ? { held: h.held, total: h.heldTotal } : null; }`
 	StorageJS = `async (page) => JSON.stringify(await page.context().storageState())`
+	// StartedJS has Playwright MCP start the browser's context, which
+	// reads a saved sign-in (UseStorage) as it starts.
+	StartedJS = `async (page) => "started"`
 )
 
 // PersonJS, run by Playwright MCP's browser_run_code_unsafe (a tool no
@@ -741,12 +759,59 @@ func (s *Session) UseProfile(ctx context.Context, secrets map[string]string) err
 // Playwright's own contextOptions.storageState. Call it before
 // Playwright MCP starts; it goes to the container on standard input,
 // never on a command line, and stays in it, read-only.
-func (s *Session) UseStorage(ctx context.Context, state []byte) error {
+// hosts are the sites it is for: what they hold is held like a detail,
+// and masked in frames, and GETs with a query to other hosts are held.
+// DropStorage removes the file once the context has it.
+func (s *Session) UseStorage(ctx context.Context, state []byte, hosts []string) error {
 	if !json.Valid(state) {
 		return fmt.Errorf("%w: a storage state is JSON", ErrInvalid)
 	}
-	s.storage = state
+	s.storage, s.signed = state, hosts
 	return s.configure(ctx)
+}
+
+// DropStorage removes a saved sign-in's file from the container, once the
+// browser's context has started with it (StartedJS): the state is in the
+// browser alone from then on (review 53).
+func (s *Session) DropStorage(ctx context.Context) error {
+	if out, err := podmanCmd(ctx, s.podman, "exec", s.name, ActNode, "-e",
+		`const fs = require("fs"), d = require("path").dirname(process.argv[1]); fs.chmodSync(d, 0o755); fs.rmSync(process.argv[1], { force: true }); fs.chmodSync(d, 0o555); if (fs.existsSync(process.argv[1])) process.exit(1);`,
+		ActStorage); err != nil {
+		return fmt.Errorf("reed: removing the sign-in's file: %v: %s", err, out)
+	}
+	return nil
+}
+
+// MinSignInValue is the shortest value of a sign-in hidden and held.
+const MinSignInValue = 8
+
+// StorageValues are the values a storage state holds (its cookies' and
+// local storage's) of at least MinSignInValue characters, each once, at
+// most 200: what is hidden and held wherever a page shows or sends it.
+func StorageValues(state []byte) []string {
+	var st struct {
+		Cookies []struct{ Value string } `json:"cookies"`
+		Origins []struct {
+			LocalStorage []struct{ Value string } `json:"localStorage"`
+		} `json:"origins"`
+	}
+	json.Unmarshal(state, &st)
+	var out []string
+	add := func(v string) {
+		if len(v) >= MinSignInValue && len(out) < 200 && !slices.Contains(out, v) {
+			out = append(out, v)
+		}
+	}
+	for _, c := range st.Cookies {
+		add(c.Value)
+	}
+	for _, o := range st.Origins {
+		for _, l := range o.LocalStorage {
+			add(l.Value)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // configure writes Playwright MCP's config with what the session was
@@ -766,6 +831,7 @@ func (s *Session) configure(ctx context.Context) error {
 	if s.storage != nil {
 		cfg["browser"].(map[string]any)["contextOptions"].(map[string]any)["storageState"] = ActStorage
 		written[ActStorage] = string(s.storage)
+		written[ActSignedIn] = jsonText(map[string]any{"hosts": s.signed, "values": StorageValues(s.storage)})
 	}
 	written[ActConfig] = jsonText(cfg)
 	files, _ := json.Marshal(written)
