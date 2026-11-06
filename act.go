@@ -18,10 +18,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	stdbase64 "encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"image"
+	"image/color"
 	stdjpeg "image/jpeg"
 	_ "image/png" // Playwright's screenshots may be PNG
 	"net"
@@ -206,6 +208,10 @@ func LaunchArgs(allowed []string, resolve map[string]string) []string {
 		"--no-sandbox", // the container is the sandbox
 		"--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check", "--crash-dumps-dir=/tmp",
 		"--disable-background-networking", "--disable-component-update", "--disable-sync",
+		// Every site's frames in a process of their own, as a full Chrome
+		// keeps them (review 52: the headless shell didn't, so masking
+		// across sites was never exercised).
+		"--site-per-process",
 	}, allowlistSwitches(allowed, resolve)...)
 }
 
@@ -369,29 +375,97 @@ var personInput = fmt.Sprintf(`const h = page.context().__heedleHold; if (!h) th
 
 // TypedJS, run by Playwright MCP's browser_run_code_unsafe at hand-back,
 // answers the values of every field a person typed into (KeyJS marks them)
-// and every password field, in every frame and open shadow root, so pirn
-// can hide them, in memory only, however they were typed (review 52: a
-// typo fixed with an arrow key split what was typed).
-var TypedJS = strings.Replace(typedJS, "MAX", strconv.Itoa(MaxTypedValue), 1)
+// and every password field, in every frame and open shadow root, read in
+// an isolated world (worldsJS), so pirn can hide them, in memory only,
+// however they were typed (review 52: a typo fixed with an arrow key split
+// what was typed). Those not in a password field now are kept to mask as
+// text in later frames.
+var TypedJS = "async (page) => { " + worldsJS + strings.Replace(typedJS, "MAX", strconv.Itoa(MaxTypedValue), 1) + " }"
 
-const typedJS = `async (page) => {
+const typedJS = `
+  const read = ((max) => {
+    const out = [], roots = [document];
+    while (roots.length) {
+      const root = roots.pop();
+      for (const e of root.querySelectorAll("*")) {
+        if (e.shadowRoot) roots.push(e.shadowRoot);
+        const pw = e.tagName === "INPUT" && (e.getAttribute("type") || "").toLowerCase() === "password";
+        if (!pw && !e.hasAttribute("data-heedle-typed")) continue;
+        const v = e.isContentEditable ? e.textContent : e.value;
+        if (typeof v === "string" && v) out.push({ v: v.slice(0, max), pw });
+      }
+    }
+    return out;
+  }).toString();
   const values = [], kept = [];
-  for (const f of page.frames()) {
-    const vs = await f.evaluate(() => {
-      const out = [];
-      const walk = (root) => {
-        for (const e of root.querySelectorAll("[data-heedle-typed], input[type=password i]")) { const v = e.isContentEditable ? e.textContent : e.value; if (typeof v === "string" && v) out.push({ v: v.slice(0, MAX), pw: e.tagName === "INPUT" && (e.getAttribute("type") || "").toLowerCase() === "password" }); }
-        for (const e of root.querySelectorAll("*")) if (e.shadowRoot) walk(e.shadowRoot);
-      };
-      walk(document);
-      return out;
-    }).catch(() => []);
-    for (const x of vs) if (values.length < 200) { values.push(x.v); if (!x.pw) kept.push(x.v); }
-  }
+  for (const vs of (await inWorlds(page, read, MAX, false)).values) for (const x of vs || []) if (values.length < 200) { values.push(x.v); if (!x.pw) kept.push(x.v); }
   const h = page.context().__heedleHold;
   if (h) for (const v of kept) if (v.length >= 4 && !h.typed.includes(v) && h.typed.length < 200) h.typed.push(v);
-  return { values };
-}`
+  return { values };`
+
+// worldsJS defines, in a script run by Playwright MCP, inWorlds(page, fn,
+// arg, rects): fn run with arg in a DevTools isolated world of every frame
+// of the page, never the page's own world, so a page that replaces its
+// String, RegExp or Array methods, or a field's value getter, sees and
+// changes nothing (review 52). Frames in a process of their own (another
+// site's) are reached through their own DevTools session. It answers each
+// frame's value (by value), or, with rects, the boxes, in the page's
+// viewport, of the elements fn answers, and each frame's document
+// (frame and loader IDs), so a page that loads another document in
+// between can be told. Sessions and worlds are kept on the browser
+// context, which only Playwright's own process reaches, and a world is
+// made again when its document changes.
+const worldsJS = `const inWorlds = async (page, fn, arg, rects) => {
+  const ctx = page.context();
+  const cache = ctx.__heedleWorlds || (ctx.__heedleWorlds = { sessions: new WeakMap(), worlds: new Map() });
+  const session = async (target) => { let s = cache.sessions.get(target); if (!s) { s = await ctx.newCDPSession(target); cache.sessions.set(target, s); } return s; };
+  const targets = [{ s: await session(page), off: [0, 0] }];
+  for (const f of page.frames()) {
+    if (f === page.mainFrame()) continue;
+    let s;
+    try { s = await session(f); } catch { continue; }
+    let off = null;
+    const fe = await f.frameElement().catch(() => null);
+    const box = fe && await fe.boundingBox();
+    if (box) { const pad = await fe.evaluate((e) => { const c = getComputedStyle(e); return [e.clientLeft + parseFloat(c.paddingLeft), e.clientTop + parseFloat(c.paddingTop)]; }); off = [box.x + pad[0], box.y + pad[1]]; }
+    targets.push({ s, off, own: true });
+  }
+  for (const t of targets) t.tree = (await t.s.send("Page.getFrameTree")).frameTree;
+  const roots = new Set(targets.filter((t) => t.own).map((t) => t.tree.frame.id));
+  const out = { values: [], rects: [], docs: [] };
+  for (const t of targets) {
+    const frames = [], todo = [t.tree];
+    while (todo.length) { const n = todo.pop(); if (n !== t.tree && roots.has(n.frame.id)) continue; frames.push(n.frame); todo.push(...(n.childFrames || [])); }
+    for (const fr of frames) {
+      const key = fr.id + "/" + fr.loaderId;
+      out.docs.push(key);
+      let r = null;
+      for (let attempt = 0; !r; attempt++) {
+        let id = cache.worlds.get(key);
+        if (!id) { id = (await t.s.send("Page.createIsolatedWorld", { frameId: fr.id, worldName: "heedle" })).executionContextId; cache.worlds.set(key, id); }
+        try { r = await t.s.send("Runtime.callFunctionOn", { functionDeclaration: fn, executionContextId: id, arguments: [{ value: arg }], returnByValue: !rects, objectGroup: "heedle" }); }
+        catch (e) { cache.worlds.delete(key); if (attempt) throw e; }
+      }
+      if (r.exceptionDetails) throw new Error("a frame couldn't be read");
+      if (!rects) { out.values.push(r.result.value); continue; }
+      if (t.off) {
+        const { result } = await t.s.send("Runtime.getProperties", { objectId: r.result.objectId, ownProperties: true });
+        for (const p of result) {
+          if (!p.value || p.value.subtype !== "node") continue;
+          let q;
+          try { q = await t.s.send("DOM.getContentQuads", { objectId: p.value.objectId }); } catch { continue; } // not rendered
+          for (const d of q.quads) {
+            const xs = [d[0], d[2], d[4], d[6]], ys = [d[1], d[3], d[5], d[7]];
+            out.rects.push([Math.min(...xs) + t.off[0], Math.min(...ys) + t.off[1], Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)]);
+          }
+        }
+      }
+      await t.s.send("Runtime.releaseObjectGroup", { objectGroup: "heedle" }).catch(() => {});
+    }
+  }
+  if (cache.worlds.size > 500) cache.worlds.clear();
+  return out;
+};`
 
 // keys are the named keys a person may press while driving; any other
 // key is one printable character, typed.
@@ -410,17 +484,17 @@ func IsKey(key string) bool {
 
 // personField defines, in a person's input's script, field(mark): the
 // focused field, in whichever frame or open shadow root has the focus
-// (never a frame's <iframe> element: the field inside it), marked as
-// typed into if mark, as {v, pw, text, area}: its value (a
-// contenteditable's text, at most MaxTypedValue characters) if it is
-// marked, else null; whether it is a password field; whether it takes
-// text; and whether Enter makes a new line in it (a textarea, a
-// contenteditable). It is null with no field focused. keep(f) adds f's
-// value, if at least four characters and not a password (a password
-// field is masked as a field), to what every frame masks as text too
-// (hold.typed; review 52: a page echoing what was typed showed it in
-// frames). Nothing typed is ever passed into the page's script.
-var personField = fmt.Sprintf(`const field = async (mark) => { for (const f of page.frames()) { const v = await f.evaluate((mark) => { if (!document.hasFocus()) return null; let a = document.activeElement; while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement; if (!a || a === document.body || a === document.documentElement || a.tagName === "IFRAME" || a.tagName === "FRAME") return null; if (mark) a.setAttribute("data-heedle-typed", ""); const t = a.tagName === "INPUT" ? (a.getAttribute("type") || "text").toLowerCase() : ""; const area = a.tagName === "TEXTAREA" || a.isContentEditable; const text = area || (a.tagName === "INPUT" && !["button", "submit", "reset", "checkbox", "radio", "file", "image", "color", "range", "hidden"].includes(t)); const raw = a.isContentEditable ? a.textContent : a.value; return { v: a.hasAttribute("data-heedle-typed") && typeof raw === "string" ? raw.slice(0, %[1]d) : null, pw: t === "password", text, area }; }, mark).catch(() => null); if (v !== null) return v; } return null; }; const keep = (f) => { const h = page.context().__heedleHold; if (h && f && !f.pw && typeof f.v === "string" && f.v.length >= 4 && !h.typed.includes(f.v) && h.typed.length < 200) h.typed.push(f.v); };`, MaxTypedValue)
+// (never a frame's <iframe> element: the field inside it), read in an
+// isolated world (worldsJS), marked as typed into if mark, as {v, pw,
+// text, area}: its value (a contenteditable's text, at most MaxTypedValue
+// characters) if it is marked, else null; whether it is a password field
+// now; whether it takes text; and whether Enter makes a new line in it (a
+// textarea, a contenteditable). It is null with no field focused. keep(f)
+// adds f's value, if at least four characters and not in a password field
+// now, to what every frame masks as text too (hold.typed; review 52: a
+// page echoing what was typed showed it in frames). Nothing typed is ever
+// passed into the page's own script.
+var personField = worldsJS + fmt.Sprintf(` const probe = ((mark) => { if (!document.hasFocus()) return null; let a = document.activeElement; while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement; if (!a || a === document.body || a === document.documentElement || a.tagName === "IFRAME" || a.tagName === "FRAME") return null; if (mark) a.setAttribute("data-heedle-typed", ""); const t = a.tagName === "INPUT" ? (a.getAttribute("type") || "text").toLowerCase() : ""; const area = a.tagName === "TEXTAREA" || a.isContentEditable; const text = area || (a.tagName === "INPUT" && !["button", "submit", "reset", "checkbox", "radio", "file", "image", "color", "range", "hidden"].includes(t)); const raw = a.isContentEditable ? a.textContent : a.value; return { v: a.hasAttribute("data-heedle-typed") && typeof raw === "string" ? raw.slice(0, %[1]d) : null, pw: t === "password", text, area }; }).toString(); const field = async (mark) => (await inWorlds(page, probe, mark, false)).values.find((v) => v) || null; const keep = (f) => { const h = page.context().__heedleHold; if (h && f && !f.pw && typeof f.v === "string" && f.v.length >= 4 && !h.typed.includes(f.v) && h.typed.length < 200) h.typed.push(f.v); };`, MaxTypedValue)
 
 // MaxTypedValue is the most of a field's value read as typed; a longer
 // value is hidden by its first MaxTypedValue characters.
@@ -467,47 +541,56 @@ func KeyJS(key string) (string, error) {
 	case " ":
 		open = "if (!(before && before.text)) { " + personInput + " }"
 	}
+	// A key that edits marks the field; Space only one that takes text (on
+	// a button it presses it; review 52).
 	mark, leave := "false", ""
-	if !keys[key] || key == "Backspace" || key == "Delete" {
+	switch {
+	case key == " ":
+		mark = "!!(before && before.text)"
+	case !keys[key] || key == "Backspace" || key == "Delete":
 		mark = "true"
 	}
 	if key == "Tab" || key == "Shift+Tab" || key == "Enter" || key == "Escape" {
 		leave = "keep(before);"
 	}
-	return "async (page) => { if (!page.context().__heedleHold) throw new Error(\"no hold\"); " + personField + " const before = await field(" + mark + "); " + open + " " + leave + " " + do +
-		" const after = await field(" + mark + "); return { before: before && before.v, after: after && after.v }; }", nil
+	return "async (page) => { if (!page.context().__heedleHold) throw new Error(\"no hold\"); " + personField + " let before = await field(false); const mark = " + mark + "; if (mark) before = await field(true); " + open + " " + leave + " " + do +
+		" const after = await field(mark); return { before: before && before.v, after: after && after.v }; }", nil
 }
 
-// ShotJSFor's script, run by Playwright MCP's browser_run_code_unsafe, is
-// a JPEG screenshot of the page (as base64) with every field holding one
-// of the person's details the step may use, and every element whose text
-// shows one, masked by Playwright's own screenshot mask, in every frame
-// (roadmap 9.8). A value is matched by its letters and digits, so one the
-// page reformats, spaces out or uppercases is masked too; it is marked for
-// the mask in the same pass, so a page changing between the two can't move
-// the mask off it. Password fields, and every field a person typed into
-// while driving (KeyJS marks them), are masked in every frame too, and
-// what they typed (hold.typed) wherever the page shows it as text (roadmap
-// 9.10). The matching runs in a world of its own (DevTools' isolated
-// world, one per process the page's frames run in), never the page's: a
-// page that replaces its String or RegExp methods sees none of the values
-// (review 52: they were passed into the page's own script). pirn takes
-// every act frame with it.
+// ShotJSFor's script, run by Playwright MCP's browser_run_code_unsafe,
+// answers {image, rects}: a JPEG screenshot of the page (as base64), with
+// password fields and every field a person typed into while driving (KeyJS
+// marks them) masked by Playwright's own screenshot mask, and the boxes of
+// every field holding one of the person's details the step may use or
+// what they typed (hold.typed), and of every smallest element whose text
+// shows one, in every frame, for ShotOf to paint over (roadmap 9.8,
+// 9.10). A value is matched by its letters and digits, so one the page
+// reformats, spaces out or uppercases is masked too. The matching runs in
+// an isolated world of each frame (worldsJS), never the page's, and writes
+// nothing to the page: no attribute tells the page which of its elements
+// hold a value (review 52: a page could plant candidates and read which
+// were marked). The boxes are read before and after the screenshot and
+// both are painted; if any frame's document changed in between, there is
+// no frame at all, never an unmasked one. A page can deny frames so (a
+// document reloading without end, or text too large to match), never get
+// an unmasked one. pirn takes every act frame with it.
 const shotJS = `async (page) => {
+  ` + worldsJS + `
   const hold = page.context().__heedleHold || {};
   const details = hold.profile || [];
   if (details.length !== WANT) throw new Error("the details to mask aren't loaded");
   const norm = (s) => (s || "").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
   const ns = details.concat((hold.typed || []).filter((v) => v.length >= 4)).map(norm).filter((v) => v.length >= 3);
   const mask = [];
-  for (const frame of page.frames()) mask.push(frame.locator('input[type="password" i], [data-heedle-typed], [data-heedle-mask]'));
-  // Marks each field holding a value, and each smallest element whose
-  // text shows one, in a frame's document and its open shadow roots. It
-  // runs in the frame's isolated world.
+  for (const frame of page.frames()) mask.push(frame.locator('input[type="password" i], [data-heedle-typed]'));
+  // The fields holding a value, and each smallest element whose text
+  // shows one, in a frame's document and its open shadow roots; at most
+  // 20 million characters of text looked at.
   const marks = ((ns) => {
     const norm = (s) => (s || "").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
-    const has = (s) => { const v = norm(s); return v !== "" && ns.some((n) => v.includes(n)); };
-    const roots = [document];
+    let budget = 20e6;
+    const has = (s) => { s = s || ""; budget -= s.length; if (budget < 0) throw new Error("too much text to mask"); const v = norm(s); return v !== "" && ns.some((n) => v.includes(n)); };
+    const out = [], roots = [document];
     while (roots.length) {
       const root = roots.pop();
       const els = [...root.querySelectorAll("*")];
@@ -515,46 +598,17 @@ const shotJS = `async (page) => {
       for (const el of els) {
         if (el.shadowRoot) roots.push(el.shadowRoot);
         const field = el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable;
-        if (field && has("value" in el ? el.value : el.textContent)) el.setAttribute("data-heedle-mask", "");
-        else if (shows.has(el) && ![...el.children].some((c) => shows.has(c))) el.setAttribute("data-heedle-mask", "");
+        if (field && has("value" in el ? el.value : el.textContent)) out.push(el);
+        else if (shows.has(el) && ![...el.children].some((c) => shows.has(c))) out.push(el);
       }
     }
-    return "marked";
+    return out;
   }).toString();
-  // Every frame of a DevTools session (a process's frames), each in an
-  // isolated world of its own; any that fails, fails the frame.
-  const isolated = async (target) => {
-    const s = await page.context().newCDPSession(target);
-    try {
-      const { frameTree } = await s.send("Page.getFrameTree");
-      const ids = [], tree = [frameTree];
-      while (tree.length) { const t = tree.pop(); ids.push(t.frame.id); tree.push(...(t.childFrames || [])); }
-      for (const frameId of ids) {
-        const { executionContextId } = await s.send("Page.createIsolatedWorld", { frameId, worldName: "heedle-mask" });
-        const r = await s.send("Runtime.callFunctionOn", { functionDeclaration: marks, executionContextId, arguments: [{ value: ns }], returnByValue: true });
-        if (r.exceptionDetails || !r.result || r.result.value !== "marked") throw new Error("the details couldn't be marked");
-      }
-    } finally {
-      await s.detach().catch(() => {});
-    }
-  };
-  if (ns.length) {
-    await isolated(page);
-    // Frames in a process of their own (another site's) have a DevTools
-    // session of their own; the others were reached from the page.
-    for (const f of page.frames()) {
-      if (f === page.mainFrame()) continue;
-      let own = true;
-      try { await (await page.context().newCDPSession(f)).detach(); } catch { own = false; }
-      if (own) await isolated(f);
-    }
-  }
-  try {
-    const b = await page.screenshot({ type: "jpeg", quality: 80, scale: "css", mask, maskColor: "#5b5f6b", animations: "disabled", timeout: 10000 });
-    return b.toString("base64");
-  } finally {
-    for (const frame of page.frames()) await frame.locator("[data-heedle-mask]").evaluateAll((els) => els.forEach((e) => e.removeAttribute("data-heedle-mask"))).catch(() => {});
-  }
+  const before = ns.length ? await inWorlds(page, marks, ns, true) : null;
+  const b = await page.screenshot({ type: "jpeg", quality: 90, scale: "css", mask, maskColor: "#5b5f6b", animations: "disabled", timeout: 10000 });
+  const after = ns.length ? await inWorlds(page, marks, ns, true) : null;
+  if (before && before.docs.slice().sort().join(" ") !== after.docs.slice().sort().join(" ")) throw new Error("the page changed while its frame was taken");
+  return { image: b.toString("base64"), rects: before ? before.rects.concat(after.rects) : [] };
 }`
 
 // ShotJSFor is ShotJS for a session given n details: it fails, rather
@@ -645,6 +699,54 @@ func FrameOf(url string, shot []byte) (Frame, error) {
 		return Frame{}, err
 	}
 	return Frame{URL: cut(url, MaxURL), JPEG: out.Bytes()}, nil
+}
+
+// MaxMaskRects bounds the boxes ShotOf paints over.
+const MaxMaskRects = 20000
+
+// maskColor is the colour masks are painted, Playwright's mask's.
+var maskColor = image.NewUniform(color.RGBA{0x5b, 0x5f, 0x6b, 0xff})
+
+// ShotOf is the screenshot a ShotJSFor call answered, as Playwright MCP's
+// browser_run_code_unsafe gives it (its "### Result" section), with every
+// box it names painted over, a little larger than the box; an answer that
+// isn't one, or names too many boxes, is an error, never an unmasked
+// image.
+func ShotOf(answer string) ([]byte, error) {
+	i := strings.Index(answer, "### Result\n")
+	var a struct {
+		Image string       `json:"image"`
+		Rects [][4]float64 `json:"rects"`
+	}
+	if i < 0 || json.NewDecoder(strings.NewReader(answer[i+len("### Result\n"):])).Decode(&a) != nil || a.Image == "" || a.Rects == nil && !strings.Contains(answer[i:], `"rects"`) {
+		return nil, fmt.Errorf("%w: not a screenshot", ErrInvalid)
+	}
+	if len(a.Rects) > MaxMaskRects {
+		return nil, fmt.Errorf("%w: %d boxes to mask", ErrInvalid, len(a.Rects))
+	}
+	shot, err := stdbase64.StdEncoding.DecodeString(a.Image)
+	if err != nil || len(shot) > MaxScreenshot {
+		return nil, fmt.Errorf("%w: not a screenshot", ErrInvalid)
+	}
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(shot))
+	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width*cfg.Height > MaxScreenshotPixels {
+		return nil, fmt.Errorf("%w: not a screenshot", ErrInvalid)
+	}
+	src, _, err := image.Decode(bytes.NewReader(shot))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	img := image.NewRGBA(src.Bounds())
+	draw.Draw(img, img.Bounds(), src, src.Bounds().Min, draw.Src)
+	for _, r := range a.Rects {
+		box := image.Rect(int(r[0])-3, int(r[1])-3, int(r[0]+r[2])+4, int(r[1]+r[3])+4).Intersect(img.Bounds())
+		draw.Draw(img, box, maskColor, image.Point{}, draw.Src)
+	}
+	var out bytes.Buffer
+	if err := stdjpeg.Encode(&out, img, &stdjpeg.Options{Quality: 90}); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
 }
 
 // jsonText is v as JSON, without HTML escaping.

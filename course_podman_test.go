@@ -1,9 +1,10 @@
 package reed_test
 
 import (
-	"encoding/base64"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"image"
 	"image/color"
 	"image/jpeg"
 	"io"
@@ -302,10 +303,24 @@ func TestContainer_ActUsesProfileWithoutShowingIt(t *testing.T) {
 	// The page replaces its String and RegExp methods: masking passes it
 	// none of the details (review 52).
 	do("browser_run_code_unsafe", map[string]any{"code": spyJS})
+	// The page plants candidates for a detail, hidden, and watches every
+	// attribute: masking tells it nothing (review 52, round 4).
+	do("browser_run_code_unsafe", map[string]any{"code": `async (page) => page.evaluate(() => {
+  const box = document.createElement("div"); box.style.display = "none";
+  for (const c of ["Ada Byron", "Ada Lovelace", "Grace Hopper"]) { const s = document.createElement("span"); s.className = "candidate"; s.textContent = c; box.append(s); }
+  document.body.append(box);
+  window.__mutated = [];
+  new MutationObserver((ms) => { for (const m of ms) if (m.attributeName !== "style" || m.target.className === "candidate") window.__mutated.push(m.attributeName); }).observe(document, { attributes: true, subtree: true });
+  return "watching";
+})`})
 	shot := do("browser_run_code_unsafe", map[string]any{"code": reed.ShotJSFor(2)})
 	unseen(t, result(t, do("browser_run_code_unsafe", map[string]any{"code": spiedJS})), "Ada Lovelace", "ada@example.org")
-	b64 := result(t, shot)
-	pic, err := jpeg.Decode(base64.NewDecoder(base64.StdEncoding, strings.NewReader(b64)))
+	// (Playwright's screenshot sets styles of its own, the same whatever
+	// matches.)
+	if m := do("browser_run_code_unsafe", map[string]any{"code": `async (page) => JSON.stringify(await page.evaluate(() => [...window.__mutated, ...[...document.querySelectorAll(".candidate")].flatMap((e) => [...e.attributes].map((a) => a.name)).filter((n) => n !== "class")]))`}); result(t, m) != "[]" {
+		t.Errorf("masking changed the page's attributes: %s", result(t, m))
+	}
+	pic, err := shotOf(shot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,7 +388,7 @@ func TestContainer_ActUsesProfileWithoutShowingIt(t *testing.T) {
   await page.evaluate(() => { const s = document.getElementById("host").attachShadow({ mode: "open" }); s.innerHTML = '<input style="width:300px;height:30px" value="ada@example.org">'; });
   await page.waitForTimeout(500); return "set"; }`})
 	shot = do("browser_run_code_unsafe", map[string]any{"code": reed.ShotJSFor(2)})
-	if pic, err = jpeg.Decode(base64.NewDecoder(base64.StdEncoding, strings.NewReader(result(t, shot)))); err != nil {
+	if pic, err = shotOf(shot); err != nil {
 		t.Fatal(err)
 	}
 	boxes = do("browser_run_code_unsafe", map[string]any{"code": `async (page) => JSON.stringify(await Promise.all([
@@ -391,6 +406,29 @@ func TestContainer_ActUsesProfileWithoutShowingIt(t *testing.T) {
 	if m := masked(rects[4]); m > 0.2 {
 		t.Errorf("other text masked %.2f", m)
 	}
+	// A frame whose document keeps changing, showing a detail each time:
+	// there is no frame, or the detail is masked; never an unmasked one
+	// (review 52, round 4: a document loaded between marking and the
+	// screenshot wasn't masked).
+	do("browser_run_code_unsafe", map[string]any{"code": `async (page) => { await page.setContent('<iframe id=flicker style="width:400px;height:80px;border:0"></iframe>'); await page.evaluate(() => { const f = document.getElementById("flicker"); let n = 0; setInterval(() => { f.srcdoc = '<p style="font:28px sans-serif;margin:0">Ada Lovelace ' + (n++) + '</p>'; }, 40); }); await page.waitForTimeout(300); return "flickering"; }`})
+	box := do("browser_run_code_unsafe", map[string]any{"code": `async (page) => JSON.stringify(await page.locator("#flicker").boundingBox())`})
+	var fr struct{ X, Y, Width, Height float64 }
+	json.Unmarshal([]byte(result(t, box)), &fr)
+	taken := 0
+	for range 6 {
+		out, isErr := call(t, cs, "browser_run_code_unsafe", map[string]any{"code": reed.ShotJSFor(2)})
+		if isErr {
+			continue
+		}
+		if pic, err = shotOf(out); err != nil {
+			t.Fatal(err)
+		}
+		taken++
+		if m := masked(struct{ X, Y, Width, Height float64 }{fr.X, fr.Y, 160, 30}); m < 0.9 {
+			t.Errorf("a changing frame's detail masked %.2f", m)
+		}
+	}
+	t.Logf("of 6 shots of a changing frame, %d taken", taken)
 }
 
 func near(a, b uint8) bool { return a >= b-12 && a <= b+12 }
@@ -456,7 +494,7 @@ func TestContainer_ActPersonDrives(t *testing.T) {
 	}
 	// The frame: the field typed into and the password field masked, the
 	// one left alone not.
-	pic, err := jpeg.Decode(base64.NewDecoder(base64.StdEncoding, strings.NewReader(result(t, run(reed.ShotJSFor(0), nil)))))
+	pic, err := shotOf(run(reed.ShotJSFor(0), nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -572,7 +610,7 @@ func TestContainer_ActPersonDrives(t *testing.T) {
 	// The page and its frame replace their String and RegExp methods:
 	// masking passes them nothing typed (review 52, round 3).
 	run(spyJS, nil)
-	pic, err = jpeg.Decode(base64.NewDecoder(base64.StdEncoding, strings.NewReader(result(t, run(reed.ShotJSFor(0), nil)))))
+	pic, err = shotOf(run(reed.ShotJSFor(0), nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -607,6 +645,14 @@ func TestContainer_ActPersonDrives(t *testing.T) {
 			t.Errorf("a send while typing %q: held %d then %d", keys, held, n)
 		}
 	}
+	// Space on a button presses it, and marks nothing (review 52, round 4).
+	run(`async (page) => { await page.getByRole("button", { name: "Sign in and save" }).focus(); return "focused"; }`, nil)
+	if out := run(reed.KeyJS(" ")); !strings.Contains(out, `"before": null`) && !strings.Contains(out, `"before":null`) {
+		t.Errorf("Space on a button: %s", out)
+	}
+	if out := run(`async (page) => String(await page.locator("[data-heedle-typed]").count() > 0 && await page.getByRole("button", { name: "Sign in and save" }).getAttribute("data-heedle-typed") !== null)`, nil); strings.Contains(out, "true") {
+		t.Error("Space marked the button as typed into")
+	}
 	run(reed.PersonDoneJS, nil)
 	if _, err := reed.ClickJS(reed.Width, 0); err == nil {
 		t.Error("a click off the page")
@@ -620,10 +666,13 @@ func TestContainer_ActPersonDrives(t *testing.T) {
 const (
 	spyJS = `async (page) => { for (const f of page.frames()) await f.evaluate(() => {
   window.__seen = []; let busy = false;
-  const spy = (proto, name) => { const o = proto[name]; proto[name] = function (...a) { if (!busy) { busy = true; try { window.__seen.push(String(this), ...a.map((x) => String(x))); } catch {} busy = false; } return o.apply(this, a); }; };
+  const apply = Reflect.apply, S = String;
+  const spy = (proto, name) => { const o = proto[name]; proto[name] = function (...a) { if (!busy) { busy = true; try { window.__seen.push(S(this)); for (const x of a) window.__seen.push(S(x)); } catch {} busy = false; } return apply(o, this, a); }; };
   for (const n of ["includes", "indexOf", "toLowerCase", "replace", "replaceAll", "match", "matchAll", "startsWith", "endsWith", "slice", "split", "normalize", "search", "trim"]) spy(String.prototype, n);
   for (const n of ["test", "exec"]) spy(RegExp.prototype, n);
-  for (const n of ["some", "includes", "indexOf", "map", "filter"]) spy(Array.prototype, n);
+  for (const n of ["some", "includes", "indexOf", "map", "filter", "join", "find", "every", "forEach"]) spy(Array.prototype, n);
+  for (const n of ["localeCompare", "codePointAt", "charAt", "at", "concat", "padStart"]) spy(String.prototype, n);
+  spy(Set.prototype, "has"); spy(Function.prototype, "call"); spy(Function.prototype, "apply");
 }); return "spying"; }`
 	spiedJS = `async (page) => { const all = []; for (const f of page.frames()) all.push(await f.evaluate(() => (window.__seen || []).join("\n")).catch(() => "")); return all.join("\n"); }`
 )
@@ -672,7 +721,9 @@ func TestContainer_ActMasksAcrossSites(t *testing.T) {
 		return out
 	}
 	call(t, cs, "browser_navigate", map[string]any{"url": "http://forms-srv:8080/iframe/"})
-	t.Log("the other site's frame: " + run(`async (page) => { await page.evaluate(() => { document.querySelector("iframe").src = "http://other-srv:8080/iframe/frame.html"; }); await page.waitForTimeout(1500); const f = page.frames().find((f) => f.url().startsWith("http://other-srv")); if (!f) throw new Error("no frame from the other site"); try { await (await page.context().newCDPSession(f)).detach(); return "in a process of its own"; } catch { return "in the page's process"; } }`, nil))
+	if where := run(`async (page) => { await page.evaluate(() => { document.querySelector("iframe").src = "http://other-srv:8080/iframe/frame.html"; }); await page.waitForTimeout(1500); const f = page.frames().find((f) => f.url().startsWith("http://other-srv")); if (!f) throw new Error("no frame from the other site"); try { await (await page.context().newCDPSession(f)).detach(); return "in a process of its own"; } catch { return "in the page's process"; } }`, nil); !strings.Contains(where, "in a process of its own") {
+		t.Fatalf("the other site's frame: %s", where)
+	}
 	box := run(`async (page) => JSON.stringify(await page.frameLocator("iframe").getByLabel("Email").boundingBox())`, nil)
 	var r struct{ X, Y, Width, Height float64 }
 	if json.Unmarshal([]byte(result(t, box)), &r) != nil || r.Width == 0 {
@@ -695,7 +746,7 @@ func TestContainer_ActMasksAcrossSites(t *testing.T) {
 	box = run(`async (page) => JSON.stringify(await page.frameLocator("iframe").getByLabel("Email").boundingBox())`, nil)
 	json.Unmarshal([]byte(result(t, box)), &r)
 	run(spyJS, nil)
-	pic, err := jpeg.Decode(base64.NewDecoder(base64.StdEncoding, strings.NewReader(result(t, run(reed.ShotJSFor(0), nil)))))
+	pic, err := shotOf(run(reed.ShotJSFor(0), nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -717,4 +768,13 @@ func TestContainer_ActMasksAcrossSites(t *testing.T) {
 		t.Errorf("masked across sites: the field %.2f, the echo %.2f", f, m)
 	}
 	run(reed.PersonDoneJS, nil)
+}
+
+// shotOf is the frame a ShotJSFor call answered, its masks painted.
+func shotOf(answer string) (image.Image, error) {
+	b, err := reed.ShotOf(answer)
+	if err != nil {
+		return nil, err
+	}
+	return jpeg.Decode(bytes.NewReader(b))
 }

@@ -129,7 +129,7 @@ func TestInv_NoMounts(t *testing.T) {
 		"--network=", "-i", "-f", "-t", "-a", "--filter", "--format",
 		"--headless", "--no-sandbox", "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check",
 		"--user-data-dir=/tmp/profile", "--crash-dumps-dir=/tmp", "--disable-background-networking",
-		"--disable-component-update", "--disable-sync", "--remote-debugging-port=9222",
+		"--disable-component-update", "--disable-sync", "--remote-debugging-port=9222", "--site-per-process",
 		"--proxy-server=http://127.0.0.1:9", "--proxy-bypass-list=<-loopback>;", "--host-resolver-rules=",
 		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp", "--window-size=",
 		// act (roadmap 9.5): Node's -e (the idle container, and writing
