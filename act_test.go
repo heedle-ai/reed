@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -517,5 +518,34 @@ func TestInv_ShotOfPaintsEveryBox(t *testing.T) {
 		if _, err := reed.ShotOf(bad); err == nil {
 			t.Errorf("%s: no error", name)
 		}
+	}
+}
+
+// TestInv_StorageValuesKeepTheLongest: past the cap of 200, what a
+// sign-in holds drops its shortest values, never a long token that
+// happens to come last (review 53, rounds 2 and 3); short values aren't
+// kept, and each is kept once.
+func TestInv_StorageValuesKeepTheLongest(t *testing.T) {
+	type kv struct {
+		Name  string `json:"name"`
+		Value string `json:"value"`
+	}
+	var cookies []kv
+	for i := range 250 {
+		cookies = append(cookies, kv{"a", strings.Repeat("x", 8) + string(rune('A'+i%26)) + string(rune('a'+i/26))})
+	}
+	cookies = append(cookies, kv{"short", "1234567"}, kv{"dup", "xxxxxxxxAa"})
+	token := "member-" + strings.Repeat("t0k", 20)
+	state, _ := json.Marshal(map[string]any{"cookies": cookies, "origins": []any{map[string]any{"origin": "https://forms.example.org", "localStorage": []kv{{"token", token}}}}})
+	got := reed.StorageValues(state)
+	if len(got) != 200 || !slices.Contains(got, token) || slices.Contains(got, "1234567") {
+		t.Fatalf("%d values, token kept %v", len(got), slices.Contains(got, token))
+	}
+	seen := map[string]bool{}
+	for _, v := range got {
+		if seen[v] {
+			t.Errorf("%q twice", v)
+		}
+		seen[v] = true
 	}
 }
