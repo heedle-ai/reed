@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/heedle-ai/reed"
 )
@@ -298,7 +299,11 @@ func TestContainer_ActUsesProfileWithoutShowingIt(t *testing.T) {
 	if out, isErr := call(t, cs, "browser_run_code_unsafe", map[string]any{"code": reed.ShotJSFor(3)}); !isErr {
 		t.Errorf("a frame with a detail missing from the mask: %.200s", out)
 	}
+	// The page replaces its String and RegExp methods: masking passes it
+	// none of the details (review 52).
+	do("browser_run_code_unsafe", map[string]any{"code": spyJS})
 	shot := do("browser_run_code_unsafe", map[string]any{"code": reed.ShotJSFor(2)})
+	unseen(t, result(t, do("browser_run_code_unsafe", map[string]any{"code": spiedJS})), "Ada Lovelace", "ada@example.org")
 	b64 := result(t, shot)
 	pic, err := jpeg.Decode(base64.NewDecoder(base64.StdEncoding, strings.NewReader(b64)))
 	if err != nil {
@@ -564,15 +569,152 @@ func TestContainer_ActPersonDrives(t *testing.T) {
 	// The field moved down with the echo above it: measure again.
 	fboxes = run(`async (page) => { const f = page.frameLocator("iframe"); return JSON.stringify(await Promise.all([f.getByLabel("Email").boundingBox(), f.getByRole("button", { name: "Subscribe" }).boundingBox()])); }`, nil)
 	json.Unmarshal([]byte(result(t, fboxes)), &frects)
+	// The page and its frame replace their String and RegExp methods:
+	// masking passes them nothing typed (review 52, round 3).
+	run(spyJS, nil)
 	pic, err = jpeg.Decode(base64.NewDecoder(base64.StdEncoding, strings.NewReader(result(t, run(reed.ShotJSFor(0), nil)))))
 	if err != nil {
 		t.Fatal(err)
 	}
+	unseen(t, result(t, run(spiedJS, nil)), "ada@example.org")
 	if f, b, e := masked(frects[0]), masked(frects[1]), masked(erect); f < 0.9 || b > 0.2 || e < 0.9 {
 		t.Errorf("masked in the frame: typed %.2f, button %.2f; the echo %.2f", f, b, e)
+	}
+	run(reed.PersonDoneJS, nil)
+	// Spaces typed in a field don't open the way, nor does Enter in a
+	// textarea: a page sending on each key is held (review 52, round 3).
+	call(t, cs, "browser_navigate", map[string]any{"url": "http://forms-srv:8080/password/"})
+	run(`async (page) => { await page.evaluate(() => { const t = document.createElement("textarea"); t.id = "note"; document.body.append(t); }); return "added"; }`, nil)
+	abox := run(`async (page) => JSON.stringify(await Promise.all([page.getByLabel("New delivery address").boundingBox(), page.locator("#note").boundingBox()]))`, nil)
+	var arects []struct{ X, Y, Width, Height float64 }
+	if json.Unmarshal([]byte(result(t, abox)), &arects) != nil || len(arects) != 2 {
+		t.Fatalf("boxes: %s", abox)
+	}
+	run(reed.PersonJS, nil)
+	for i, field := range arects {
+		run(reed.ClickJS(int(field.X+5), int(field.Y+5)))
+		time.Sleep(reed.PersonWindow + 500*time.Millisecond)
+		held = heldTotal()
+		keys := strings.Split("12 Typed Street", "")
+		if i == 1 {
+			keys = []string{"a", "Enter", "b"}
+		}
+		for _, k := range keys {
+			run(reed.KeyJS(k))
+		}
+		run(`async (page) => page.evaluate(() => fetch("/password/submit", { method: "POST", body: new URLSearchParams({ email: "keys@example.org" }) }).then(() => "sent", () => "held"))`, nil)
+		if n := heldTotal(); n != held+1 {
+			t.Errorf("a send while typing %q: held %d then %d", keys, held, n)
+		}
 	}
 	run(reed.PersonDoneJS, nil)
 	if _, err := reed.ClickJS(reed.Width, 0); err == nil {
 		t.Error("a click off the page")
 	}
+}
+
+// spyJS replaces, in every frame of the page, the String, RegExp and Array
+// methods a matcher would use with ones that note everything they're
+// given; spiedJS answers what they noted. A page can do the same, so no
+// value to mask may ever reach them (review 52).
+const (
+	spyJS = `async (page) => { for (const f of page.frames()) await f.evaluate(() => {
+  window.__seen = []; let busy = false;
+  const spy = (proto, name) => { const o = proto[name]; proto[name] = function (...a) { if (!busy) { busy = true; try { window.__seen.push(String(this), ...a.map((x) => String(x))); } catch {} busy = false; } return o.apply(this, a); }; };
+  for (const n of ["includes", "indexOf", "toLowerCase", "replace", "replaceAll", "match", "matchAll", "startsWith", "endsWith", "slice", "split", "normalize", "search", "trim"]) spy(String.prototype, n);
+  for (const n of ["test", "exec"]) spy(RegExp.prototype, n);
+  for (const n of ["some", "includes", "indexOf", "map", "filter"]) spy(Array.prototype, n);
+}); return "spying"; }`
+	spiedJS = `async (page) => { const all = []; for (const f of page.frames()) all.push(await f.evaluate(() => (window.__seen || []).join("\n")).catch(() => "")); return all.join("\n"); }`
+)
+
+// unseen fails t if the page's spies (spyJS) saw any of values, as given
+// or as letters and digits.
+func unseen(t *testing.T, seen string, values ...string) {
+	t.Helper()
+	low := strings.ToLower(seen)
+	for _, v := range values {
+		n := strings.Map(func(r rune) rune {
+			if unicode.IsLetter(r) || unicode.IsDigit(r) {
+				return unicode.ToLower(r)
+			}
+			return -1
+		}, v)
+		if strings.Contains(low, strings.ToLower(v)) || strings.Contains(low, n) {
+			t.Errorf("the page's own script saw %q", v)
+		}
+	}
+}
+
+// TestContainer_ActMasksAcrossSites: a person types in a form framed from
+// another site (a frame in a process of its own): the field is marked and
+// read, a typo fixed there too, and the field and the page's echo of it
+// are masked, matched where the page's own script can't see the values
+// (review 52, round 3).
+func TestContainer_ActMasksAcrossSites(t *testing.T) {
+	img := testActBrowser(t)
+	network, _, _ := courseSites(t)
+	s, err := reed.Browser{Image: img, Network: network}.Start(ctx, reed.Visit{URL: "http://forms-srv:8080/iframe/", Allow: []string{"other-srv"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	cs := mcpSession(t, s)
+	run := func(code string, err error) string {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, isErr := call(t, cs, "browser_run_code_unsafe", map[string]any{"code": code})
+		if isErr {
+			t.Fatalf("%.80s: %.600s", code, out)
+		}
+		return out
+	}
+	call(t, cs, "browser_navigate", map[string]any{"url": "http://forms-srv:8080/iframe/"})
+	t.Log("the other site's frame: " + run(`async (page) => { await page.evaluate(() => { document.querySelector("iframe").src = "http://other-srv:8080/iframe/frame.html"; }); await page.waitForTimeout(1500); const f = page.frames().find((f) => f.url().startsWith("http://other-srv")); if (!f) throw new Error("no frame from the other site"); try { await (await page.context().newCDPSession(f)).detach(); return "in a process of its own"; } catch { return "in the page's process"; } }`, nil))
+	box := run(`async (page) => JSON.stringify(await page.frameLocator("iframe").getByLabel("Email").boundingBox())`, nil)
+	var r struct{ X, Y, Width, Height float64 }
+	if json.Unmarshal([]byte(result(t, box)), &r) != nil || r.Width == 0 {
+		t.Fatalf("box: %s", box)
+	}
+	run(reed.PersonJS, nil)
+	run(reed.ClickJS(int(r.X+5), int(r.Y+5)))
+	for _, k := range append(strings.Split("ada@example.og", ""), "ArrowLeft", "r") {
+		run(reed.KeyJS(k))
+	}
+	if out := run(reed.KeyJS("End")); !strings.Contains(out, "ada@example.org") {
+		t.Errorf("the field's value, across sites: %s", out)
+	}
+	if typed := run(reed.TypedJS, nil); !strings.Contains(typed, `"ada@example.org"`) {
+		t.Errorf("typed across sites: %s", typed)
+	}
+	echo := run(`async (page) => { const f = page.frames().find((f) => f.url().startsWith("http://other-srv")); await f.evaluate(() => { const p = document.createElement("p"); p.style.font = "24px sans-serif"; p.textContent = "Signed in as ada@example.org"; document.body.prepend(p); }); return JSON.stringify(await page.frameLocator("iframe").getByText("Signed in as").boundingBox()); }`, nil)
+	var e struct{ X, Y, Width, Height float64 }
+	json.Unmarshal([]byte(result(t, echo)), &e)
+	box = run(`async (page) => JSON.stringify(await page.frameLocator("iframe").getByLabel("Email").boundingBox())`, nil)
+	json.Unmarshal([]byte(result(t, box)), &r)
+	run(spyJS, nil)
+	pic, err := jpeg.Decode(base64.NewDecoder(base64.StdEncoding, strings.NewReader(result(t, run(reed.ShotJSFor(0), nil)))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unseen(t, result(t, run(spiedJS, nil)), "ada@example.org")
+	masked := func(r struct{ X, Y, Width, Height float64 }) float64 {
+		in, all := 0, 0
+		for y := int(r.Y) + 2; y < int(r.Y+r.Height)-2; y++ {
+			for x := int(r.X) + 2; x < int(r.X+r.Width)-2; x++ {
+				c := color.RGBAModel.Convert(pic.At(x, y)).(color.RGBA)
+				all++
+				if near(c.R, 0x5b) && near(c.G, 0x5f) && near(c.B, 0x6b) {
+					in++
+				}
+			}
+		}
+		return float64(in) / float64(max(all, 1))
+	}
+	if f, m := masked(r), masked(e); f < 0.9 || m < 0.9 {
+		t.Errorf("masked across sites: the field %.2f, the echo %.2f", f, m)
+	}
+	run(reed.PersonDoneJS, nil)
 }
