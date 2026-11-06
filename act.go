@@ -293,7 +293,8 @@ func (s *Session) Command(ctx context.Context) *exec.Cmd {
 // before the browser starts, lifts the hold for the session. The state
 // lives on the browser context, which only Playwright MCP's own process
 // can reach.
-const HoldJS = `exports.default = async ({ page }) => {
+const HoldJS = `let signedIn = null; // read once, kept for every context, as its file goes (review 53)
+exports.default = async ({ page }) => {
   const fs = require("fs");
   const context = page.context();
   let hold = context.__heedleHold;
@@ -302,11 +303,14 @@ const HoldJS = `exports.default = async ({ page }) => {
     try { hold.profile = JSON.parse(fs.readFileSync(` + "`" + ActProfile + "`" + `, "utf8")); } catch {}
     // Signed in as the person (roadmap 9.11): what the sign-ins hold is
     // held like a detail wherever a request carries it, and masked in
-    // frames; and a GET with a query to a host not signed in is held, so
-    // another allowed host can't carry off what a signed-in page showed
-    // (review 53).
-    hold.signed = []; hold.secret = [];
-    try { const s = JSON.parse(fs.readFileSync(` + "`" + ActSignedIn + "`" + `, "utf8")); hold.signed = s.hosts; hold.secret = s.values; hold.typed.push(...s.values); } catch {}
+    // frames; and a GET with a query to a host not signed in, and the page
+    // itself going to one, are held: Claude, or a page, sending what a
+    // signed-in page showed to another allowed host (review 53). A path
+    // a page's own image or script names on another allowed host isn't
+    // caught, nor is anything during a confirmed send's open way.
+    if (!signedIn) { try { signedIn = JSON.parse(fs.readFileSync(` + "`" + ActSignedIn + "`" + `, "utf8")); } catch {} }
+    hold.signed = (signedIn && signedIn.hosts) || []; hold.secret = (signedIn && signedIn.values) || [];
+    hold.typed.push(...hold.secret);
     const freely = fs.existsSync(` + "`" + ActSendFreely + "`" + `);
     // A person's input (ClickJS, KeyJS) opens the way for PersonWindow
     // from that input, never the whole pause (review 52).
@@ -337,7 +341,12 @@ const HoldJS = `exports.default = async ({ page }) => {
     await context.route("**/*", (route) => {
       const r = route.request(), m = r.method();
       let off = false;
-      if (hold.signed.length && m === "GET") { try { const u = new URL(r.url()); off = u.search !== "" && !hold.signed.includes(u.hostname); } catch {} }
+      if (hold.signed.length && m === "GET") {
+        try {
+          const u = new URL(r.url()), away = !hold.signed.includes(u.hostname);
+          off = away && (u.search !== "" || (r.isNavigationRequest() && !r.frame().parentFrame()));
+        } catch {}
+      }
       const sends = !(m === "GET" || m === "HEAD" || m === "OPTIONS") || carries(r) || off;
       if (passes()) { if (yours() && sends) byYou(m + " " + r.url()); return route.fallback(); }
       if (!sends) return route.fallback();
@@ -775,8 +784,8 @@ func (s *Session) UseStorage(ctx context.Context, state []byte, hosts []string) 
 // browser alone from then on (review 53).
 func (s *Session) DropStorage(ctx context.Context) error {
 	if out, err := podmanCmd(ctx, s.podman, "exec", s.name, ActNode, "-e",
-		`const fs = require("fs"), d = require("path").dirname(process.argv[1]); fs.chmodSync(d, 0o755); fs.rmSync(process.argv[1], { force: true }); fs.chmodSync(d, 0o555); if (fs.existsSync(process.argv[1])) process.exit(1);`,
-		ActStorage); err != nil {
+		`const fs = require("fs"), d = require("path").dirname(process.argv[1]); fs.chmodSync(d, 0o755); try { for (const f of process.argv.slice(1)) fs.rmSync(f, { force: true }); } finally { fs.chmodSync(d, 0o555); } if (process.argv.slice(1).some((f) => fs.existsSync(f))) process.exit(1);`,
+		ActStorage, ActSignedIn); err != nil {
 		return fmt.Errorf("reed: removing the sign-in's file: %v: %s", err, out)
 	}
 	return nil
@@ -796,18 +805,22 @@ func StorageValues(state []byte) []string {
 		} `json:"origins"`
 	}
 	json.Unmarshal(state, &st)
-	var out []string
-	add := func(v string) {
-		if len(v) >= MinSignInValue && len(out) < 200 && !slices.Contains(out, v) {
-			out = append(out, v)
-		}
-	}
+	var all []string
 	for _, c := range st.Cookies {
-		add(c.Value)
+		all = append(all, c.Value)
 	}
 	for _, o := range st.Origins {
 		for _, l := range o.LocalStorage {
-			add(l.Value)
+			all = append(all, l.Value)
+		}
+	}
+	// Longest first, so a long token is never the one past the cap
+	// (review 53).
+	sort.SliceStable(all, func(i, j int) bool { return len(all[i]) > len(all[j]) })
+	var out []string
+	for _, v := range all {
+		if len(v) >= MinSignInValue && len(out) < 200 && !slices.Contains(out, v) {
+			out = append(out, v)
 		}
 	}
 	sort.Strings(out)
