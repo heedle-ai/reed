@@ -4,6 +4,9 @@
 //	server course DIR   serve the forms in DIR (testdata/forms)
 //	                    and, at GET /ws/<form>, a WebSocket whose every
 //	                    message is recorded as that form's ws=<message>
+//	                    ; a form received sets a cookie for it, and GET
+//	                    /whoami/<form> says whether the browser has it
+//	                    (a site that keeps you signed in, roadmap 9.11)
 //	server decoy        count every request; GET /hits says how many
 //
 // It listens on $COURSE_ADDR, :8080 if unset.
@@ -87,6 +90,7 @@ func main() {
 		if err := json.Unmarshal(b, &course); err != nil {
 			panic(err)
 		}
+		token := os.Getenv("COURSE_TOKEN")
 		var mu sync.Mutex
 		got := map[string][]url.Values{}
 		http.HandleFunc("POST /{form}/submit", func(w http.ResponseWriter, r *http.Request) {
@@ -106,6 +110,7 @@ func main() {
 			mu.Lock()
 			got[name] = append(got[name], r.PostForm)
 			mu.Unlock()
+			http.SetCookie(w, &http.Cookie{Name: "course-" + name, Value: "member-" + token, Path: "/", HttpOnly: true, MaxAge: 3600})
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			fmt.Fprint(w, "<!doctype html><title>Thank you</title><h1>Thank you</h1><p>We received your form.</p>")
 		})
@@ -130,7 +135,6 @@ func main() {
 				mu.Unlock()
 			}
 		})
-		token := os.Getenv("COURSE_TOKEN")
 		http.HandleFunc("GET /check/{form}", func(w http.ResponseWriter, r *http.Request) {
 			f, ok := course[r.PathValue("form")]
 			if !ok || token == "" || r.URL.Query().Get("token") != token {
@@ -148,6 +152,19 @@ func main() {
 				c.Done = len(c.Received) == 0
 			}
 			json.NewEncoder(w).Encode(c)
+		})
+		http.HandleFunc("GET /whoami/{form}", func(w http.ResponseWriter, r *http.Request) {
+			name := r.PathValue("form")
+			if _, ok := course[name]; !ok {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			if c, err := r.Cookie("course-" + name); err == nil && c.Value == "member-"+token {
+				fmt.Fprint(w, "<!doctype html><title>Your account</title><h1>Signed in as a course member</h1>")
+				return
+			}
+			fmt.Fprint(w, "<!doctype html><title>Your account</title><h1>Not signed in</h1>")
 		})
 		files := http.FileServer(http.Dir(dir))
 		http.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {

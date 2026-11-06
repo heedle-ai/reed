@@ -58,6 +58,9 @@ const (
 	// ActProfile lists the person's details a step may use (roadmap 9.8),
 	// for HoldJS to mask wherever a frame shows them (ShotJS).
 	ActProfile = ActHoldDir + "/profile.json"
+	// ActStorage is a saved sign-in's storage state, which the browser
+	// starts with (roadmap 9.11), beside the hold, read-only.
+	ActStorage = ActHoldDir + "/storage.json"
 	// ActLabel marks act containers. They live as long as a step, much
 	// longer than a visit, so browse's Sweep never touches them; Start
 	// sweeps those older than StaleActAfter.
@@ -98,6 +101,8 @@ type Session struct {
 	name    string
 	allowed []string
 	resolve map[string]string
+	secrets map[string]string // UseProfile's, kept to write the config again
+	storage []byte            // UseStorage's
 	once    sync.Once
 	// stop ends Playwright MCP when SessionTimeout passes or the session
 	// is closed, whatever the caller's deadline (review 39: the bound
@@ -346,11 +351,14 @@ const HoldJS = `exports.default = async ({ page }) => {
 // ReleaseJS, run by Playwright MCP's browser_run_code_unsafe (a tool no
 // model is given), opens the hold for the one action that sends, after a
 // person confirmed it; CloseJS closes it again once that action is done.
-// HeldJS answers the requests held so far.
+// HeldJS answers the requests held so far. StorageJS answers the
+// browser's storage state (Playwright's own: cookies and local storage),
+// for a person keeping their sign-in (roadmap 9.11).
 const (
 	ReleaseJS = `async (page) => { const h = page.context().__heedleHold; if (!h) throw new Error("no hold"); h.open = Date.now() + 30000; return "released"; }`
 	CloseJS   = `async (page) => { const h = page.context().__heedleHold; if (h) h.open = 0; return "closed"; }`
 	HeldJS    = `async (page) => { const h = page.context().__heedleHold; return h ? { held: h.held, total: h.heldTotal } : null; }`
+	StorageJS = `async (page) => JSON.stringify(await page.context().storageState())`
 )
 
 // PersonJS, run by Playwright MCP's browser_run_code_unsafe (a tool no
@@ -724,15 +732,43 @@ func ShotJSFor(n int) string { return strings.Replace(shotJS, "WANT", strconv.It
 // for ShotJS to mask. They go to the container on standard input, never
 // on a command line, and stay in it.
 func (s *Session) UseProfile(ctx context.Context, secrets map[string]string) error {
-	cfg := PlaywrightConfig(s.allowed, s.resolve)
-	cfg["secrets"] = secrets
-	vals := make([]string, 0, len(secrets))
-	for _, v := range secrets {
-		vals = append(vals, v)
+	s.secrets = secrets
+	return s.configure(ctx)
+}
+
+// UseStorage gives the session a saved sign-in (roadmap 9.11): a storage
+// state (cookies and local storage) the browser's context starts with,
+// Playwright's own contextOptions.storageState. Call it before
+// Playwright MCP starts; it goes to the container on standard input,
+// never on a command line, and stays in it, read-only.
+func (s *Session) UseStorage(ctx context.Context, state []byte) error {
+	if !json.Valid(state) {
+		return fmt.Errorf("%w: a storage state is JSON", ErrInvalid)
 	}
-	sort.Strings(vals)
-	c, p := jsonText(cfg), jsonText(vals) // values exactly as given: no \u0026 for "&" (review 42)
-	files, _ := json.Marshal(map[string]string{ActConfig: c, ActProfile: p})
+	s.storage = state
+	return s.configure(ctx)
+}
+
+// configure writes Playwright MCP's config with what the session was
+// given (details, a saved sign-in), and their files beside the hold.
+func (s *Session) configure(ctx context.Context) error {
+	cfg := PlaywrightConfig(s.allowed, s.resolve)
+	written := map[string]string{}
+	if s.secrets != nil {
+		cfg["secrets"] = s.secrets
+		vals := make([]string, 0, len(s.secrets))
+		for _, v := range s.secrets {
+			vals = append(vals, v)
+		}
+		sort.Strings(vals)
+		written[ActProfile] = jsonText(vals) // values exactly as given: no \u0026 for "&" (review 42)
+	}
+	if s.storage != nil {
+		cfg["browser"].(map[string]any)["contextOptions"].(map[string]any)["storageState"] = ActStorage
+		written[ActStorage] = string(s.storage)
+	}
+	written[ActConfig] = jsonText(cfg)
+	files, _ := json.Marshal(written)
 	put := exec.CommandContext(ctx, s.podman, "exec", "-i", s.name, ActNode, "-e",
 		`const fs = require("fs"), d = process.argv[1]; fs.chmodSync(d, 0o755); `+
 			`for (const [f, b] of Object.entries(JSON.parse(fs.readFileSync(0)))) { try { fs.chmodSync(f, 0o644); } catch {} fs.writeFileSync(f, b, { mode: 0o444 }); fs.chmodSync(f, 0o444); } fs.chmodSync(d, 0o555);`,
