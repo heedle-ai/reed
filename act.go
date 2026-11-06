@@ -31,6 +31,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/image/draw"
 )
@@ -279,11 +281,14 @@ const HoldJS = `exports.default = async ({ page }) => {
   const context = page.context();
   let hold = context.__heedleHold;
   if (!hold) {
-    hold = context.__heedleHold = { open: 0, held: [], heldTotal: 0, profile: [] };
+    hold = context.__heedleHold = { open: 0, person: false, held: [], heldTotal: 0, byYou: [], byYouTotal: 0, profile: [] };
     try { hold.profile = JSON.parse(fs.readFileSync(` + "`" + ActProfile + "`" + `, "utf8")); } catch {}
     const freely = fs.existsSync(` + "`" + ActSendFreely + "`" + `);
-    const passes = () => freely || Date.now() < hold.open;
+    const passes = () => freely || hold.person || Date.now() < hold.open;
     const held = (what) => { hold.heldTotal++; if (hold.held.length < 100) hold.held.push(what.slice(0, 520)); };
+    // What a person sends while they drive (PersonJS) is theirs, and is
+    // counted as sent by them (roadmap 9.10).
+    const byYou = (what) => { hold.byYouTotal++; if (hold.byYou.length < 100) hold.byYou.push(what.slice(0, 520)); };
     // A request carrying one of the person's details, in the URL or the
     // body, plainly, encoded or as a phone number's digits, is held like
     // a send, whatever its method (review 42: a page could read a filled
@@ -303,12 +308,14 @@ const HoldJS = `exports.default = async ({ page }) => {
     };
     await context.route("**/*", (route) => {
       const r = route.request(), m = r.method();
-      if (passes() || (m === "GET" || m === "HEAD" || m === "OPTIONS") && !carries(r)) return route.fallback();
+      const sends = !(m === "GET" || m === "HEAD" || m === "OPTIONS") || carries(r);
+      if (passes()) { if (hold.person && sends) byYou(m + " " + r.url()); return route.fallback(); }
+      if (!sends) return route.fallback();
       held(m + " " + r.url());
       return route.abort("blockedbyclient");
     });
     await context.routeWebSocket("**/*", (ws) => {
-      if (passes()) { ws.connectToServer(); return; }
+      if (passes()) { if (hold.person) byYou("WS " + ws.url()); ws.connectToServer(); return; }
       ws.onMessage(() => held("WS " + ws.url()));
     });
   }
@@ -326,6 +333,58 @@ const (
 	HeldJS    = `async (page) => { const h = page.context().__heedleHold; return h ? { held: h.held, total: h.heldTotal } : null; }`
 )
 
+// PersonJS, run by Playwright MCP's browser_run_code_unsafe (a tool no
+// model is given), hands the browser to a person (roadmap 9.10): the hold
+// lets what they send through, and counts it as sent by them, until
+// PersonDoneJS hands it back, which answers what they sent.
+const (
+	PersonJS     = `async (page) => { const h = page.context().__heedleHold; if (!h) throw new Error("no hold"); h.person = true; h.byYou = []; h.byYouTotal = 0; return "yours"; }`
+	PersonDoneJS = `async (page) => { const h = page.context().__heedleHold; if (!h) return null; h.person = false; return { sent: h.byYou, total: h.byYouTotal }; }`
+)
+
+// keys are the named keys a person may press while driving; any other
+// key is one printable character, typed.
+var keys = map[string]bool{"Enter": true, "Tab": true, "Shift+Tab": true, "Backspace": true, "Delete": true, "Escape": true,
+	"ArrowUp": true, "ArrowDown": true, "ArrowLeft": true, "ArrowRight": true, "Home": true, "End": true, "PageUp": true, "PageDown": true}
+
+// IsKey says whether key is one a person may press while driving: a named
+// key, or one printable character.
+func IsKey(key string) bool {
+	if keys[key] {
+		return true
+	}
+	r, n := utf8.DecodeRuneInString(key)
+	return n == len(key) && n > 0 && r != utf8.RuneError && unicode.IsPrint(r)
+}
+
+// markTyped marks the field a person is typing into, in whichever frame
+// has the focus, so every later frame masks it (ShotJSFor).
+const markTyped = `for (const f of page.frames()) { await f.evaluate(() => { if (!document.hasFocus()) return; let a = document.activeElement; while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement; if (a && a !== document.body && a !== document.documentElement) a.setAttribute("data-heedle-typed", ""); }).catch(() => {}); }`
+
+// ClickJS is a person's click at (x, y) on the page, in CSS pixels of the
+// viewport, as DevTools input events (Playwright's mouse) (roadmap 9.10).
+func ClickJS(x, y int) (string, error) {
+	if x < 0 || y < 0 || x >= Width || y >= Height {
+		return "", fmt.Errorf("%w: a click at %d,%d is off the page", ErrInvalid, x, y)
+	}
+	return fmt.Sprintf("async (page) => { await page.mouse.click(%d, %d); return \"clicked\"; }", x, y), nil
+}
+
+// KeyJS is a person's key press (IsKey) as DevTools input events
+// (Playwright's keyboard): a named key is pressed, a character typed, and
+// the field it goes to is marked to be masked in every later frame.
+func KeyJS(key string) (string, error) {
+	if !IsKey(key) {
+		return "", fmt.Errorf("%w: not a key a person may press here", ErrInvalid)
+	}
+	k := jsonText(key) // a string literal: nothing in key can be code
+	do := "await page.keyboard.type(" + k + ");"
+	if keys[key] {
+		do = "await page.keyboard.press(" + k + ");"
+	}
+	return "async (page) => { " + do + " " + markTyped + " return \"pressed\"; }", nil
+}
+
 // ShotJSFor's script, run by Playwright MCP's browser_run_code_unsafe, is
 // a JPEG screenshot of the page (as base64) with every field holding one
 // of the person's details the step may use, and every piece of text that
@@ -333,11 +392,16 @@ const (
 // (roadmap 9.8). A field is matched by its letters and digits, so a value
 // the page reformats or uppercases is masked too; it is marked for the
 // mask in the same pass, so a page changing between the two can't move
-// the mask off it. pirn takes frames with it when a step uses details.
+// the mask off it. Password fields, and every field a person typed into
+// while driving (KeyJS marks them), are masked in every frame too
+// (roadmap 9.10). pirn takes every act frame with it.
 const shotJS = `async (page) => {
   const vals = (page.context().__heedleHold || {}).profile || [];
   if (vals.length !== WANT) throw new Error("the details to mask aren't loaded");
   const mask = [];
+  // Password fields, and fields a person typed into while driving, are
+  // masked in every frame, whatever the step uses (roadmap 9.10).
+  for (const frame of page.frames()) mask.push(frame.locator('input[type="password" i], [data-heedle-typed]'));
   const norm = (s) => (s || "").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
   const ns = vals.map(norm).filter((v) => v.length >= 3);
   if (vals.length) {
