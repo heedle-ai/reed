@@ -12,3 +12,6 @@ func SetLookupIP(f func(context.Context, string) ([]net.IPAddr, error)) (restore
 	lookupIP = f
 	return func() { lookupIP = old }
 }
+
+// Name is the session's container's name, for tests.
+func (s *Session) Name() string { return s.name }

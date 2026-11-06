@@ -90,6 +90,7 @@ jobs:
           grep -q -- '--- PASS: TestContainer_ActHoldsFormsUntilConfirmed' containers.log
           grep -q -- '--- PASS: TestContainer_ActPersonDrives' containers.log
           grep -q -- '--- PASS: TestContainer_ActMasksAcrossSites' containers.log
+          grep -q -- '--- PASS: TestContainer_ActStartsSignedIn' containers.log
           # No test leaves a file in the checkout (review 52: an oom file
           # was committed three times).
           if [ -n "$(git status --porcelain --untracked-files=all .)" ]; then git status --porcelain --untracked-files=all .; echo 'a test left files in the checkout'; exit 1; fi

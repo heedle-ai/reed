@@ -410,10 +410,10 @@ func TestInv_ProfileGoesOnStandardInput(t *testing.T) {
 	}
 	// A saved sign-in (roadmap 9.11): on standard input too, beside the
 	// hold, the browser's context starting with it; the details kept.
-	if err := s.UseStorage(context.Background(), []byte(`{"cookies":[{"name":"sid","value":"c00kie-77","domain":"forms.example.org"}],"origins":[]}`)); err != nil {
+	if err := s.UseStorage(context.Background(), []byte(`{"cookies":[{"name":"sid","value":"c00kie-77","domain":"forms.example.org"},{"name":"x","value":"short","domain":"forms.example.org"}],"origins":[{"origin":"https://forms.example.org","localStorage":[{"name":"t","value":"t0ken-in-storage"}]}]}`), []string{"forms.example.org"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UseStorage(context.Background(), []byte(`not json`)); !errors.Is(err, reed.ErrInvalid) {
+	if err := s.UseStorage(context.Background(), []byte(`not json`), nil); !errors.Is(err, reed.ErrInvalid) {
 		t.Errorf("a storage state that isn't JSON: %v", err)
 	}
 	log, _ = os.ReadFile(filepath.Join(dir, "log"))
@@ -422,8 +422,16 @@ func TestInv_ProfileGoesOnStandardInput(t *testing.T) {
 	for dec.Decode(&files) == nil && files[reed.ActStorage] == "" {
 	}
 	if strings.Contains(string(log), "c00kie") || !strings.Contains(files[reed.ActStorage], "c00kie-77") || !strings.Contains(files[reed.ActConfig], `"storageState":"`+reed.ActStorage+`"`) ||
-		!strings.Contains(files[reed.ActConfig], `"secrets":{`) || files[reed.ActProfile] == "" || !strings.HasPrefix(reed.ActStorage, reed.ActHoldDir+"/") {
+		!strings.Contains(files[reed.ActConfig], `"secrets":{`) || files[reed.ActProfile] == "" || !strings.HasPrefix(reed.ActStorage, reed.ActHoldDir+"/") ||
+		files[reed.ActSignedIn] != `{"hosts":["forms.example.org"],"values":["c00kie-77","t0ken-in-storage"]}` {
 		t.Errorf("files written for a sign-in: %v", files)
+	}
+	// Once the browser has it, the file goes (review 53).
+	if err := s.DropStorage(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if log, _ = os.ReadFile(filepath.Join(dir, "log")); !strings.Contains(string(log), "rmSync") || !strings.Contains(string(log), reed.ActStorage) {
+		t.Errorf("the sign-in's file wasn't removed:\n%s", log)
 	}
 }
 

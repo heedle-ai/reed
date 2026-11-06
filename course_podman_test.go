@@ -938,3 +938,63 @@ func mustClick(t *testing.T, x, y int) string {
 	}
 	return js
 }
+
+// TestContainer_ActStartsSignedIn: a session given a saved sign-in
+// (UseStorage) starts signed in on its site; once the context has it, its
+// file is gone from the container, and the browser can't open it; what it
+// holds is held wherever a request carries it, and a GET with a query to
+// a host not signed in is held (roadmap 9.11, review 53).
+func TestContainer_ActStartsSignedIn(t *testing.T) {
+	img := testActBrowser(t)
+	network, check, _ := courseSites(t)
+	s, err := reed.Browser{Image: img, Network: network}.Start(ctx, reed.Visit{URL: "http://forms-srv:8080/whoami/password", Allow: []string{"other-srv"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	state := `{"cookies":[{"name":"course-password","value":"member-t0ken","domain":"forms-srv","path":"/","expires":-1,"httpOnly":true,"secure":false,"sameSite":"Lax"}],"origins":[]}`
+	if err := s.UseStorage(ctx, []byte(state), []string{"forms-srv"}); err != nil {
+		t.Fatal(err)
+	}
+	cs := mcpSession(t, s)
+	run := func(code string) string {
+		t.Helper()
+		out, isErr := call(t, cs, "browser_run_code_unsafe", map[string]any{"code": code})
+		if isErr {
+			t.Fatalf("%.80s: %.400s", code, out)
+		}
+		return out
+	}
+	if out := run(reed.StartedJS); !strings.Contains(out, "started") {
+		t.Fatalf("started: %s", out)
+	}
+	if err := s.DropStorage(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("podman", "exec", s.Name(), reed.ActNode, "-e", "console.log(require('fs').readdirSync(process.argv[1]).join(' '))", reed.ActHoldDir).CombinedOutput(); err != nil || strings.Contains(string(out), "storage.json") {
+		t.Errorf("the sign-in's file is still there: %v %s", err, out)
+	}
+	if out, _ := call(t, cs, "browser_navigate", map[string]any{"url": "file://" + reed.ActStorage}); strings.Contains(out, "member-") {
+		t.Errorf("the browser read the sign-in's file: %.300s", out)
+	}
+	call(t, cs, "browser_navigate", map[string]any{"url": "http://forms-srv:8080/whoami/password"})
+	if snap, _ := call(t, cs, "browser_snapshot", nil); !strings.Contains(snap, "Signed in as a course member") {
+		t.Errorf("not signed in:\n%s", snap)
+	}
+	heldTotal := func() int {
+		var h struct{ Total int }
+		out := run(reed.HeldJS)
+		if i := strings.IndexByte(out, '{'); i < 0 || json.NewDecoder(strings.NewReader(out[i:])).Decode(&h) != nil {
+			t.Fatalf("held: %s", out)
+		}
+		return h.Total
+	}
+	held := heldTotal()
+	run(`async (page) => { await page.evaluate(() => Promise.all([fetch("http://forms-srv:8080/contact/?t=member-t0ken").catch(() => 0), fetch("http://other-srv:8080/contact/?d=anything").catch(() => 0), fetch("http://other-srv:8080/contact/").catch(() => 0)])); return "sent"; }`)
+	if n := heldTotal(); n != held+2 {
+		t.Errorf("a GET carrying the sign-in, and a GET with a query to a host not signed in: held %d then %d", held, n)
+	}
+	if got := check("contact").Received; len(got) != 0 {
+		t.Errorf("received: %v", got)
+	}
+}
