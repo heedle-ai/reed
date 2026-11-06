@@ -408,6 +408,23 @@ func TestInv_ProfileGoesOnStandardInput(t *testing.T) {
 		!strings.Contains(files[reed.ActConfig], `"secrets":{"⟨address⟩":"Flat 2 & 3 <B>","⟨email⟩":"ada@example.org","⟨name⟩":"Ada Lovelace"}`) || !strings.HasPrefix(reed.ActProfile, reed.ActHoldDir+"/") {
 		t.Errorf("files written: %s", b)
 	}
+	// A saved sign-in (roadmap 9.11): on standard input too, beside the
+	// hold, the browser's context starting with it; the details kept.
+	if err := s.UseStorage(context.Background(), []byte(`{"cookies":[{"name":"sid","value":"c00kie-77","domain":"forms.example.org"}],"origins":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UseStorage(context.Background(), []byte(`not json`)); !errors.Is(err, reed.ErrInvalid) {
+		t.Errorf("a storage state that isn't JSON: %v", err)
+	}
+	log, _ = os.ReadFile(filepath.Join(dir, "log"))
+	b, _ = os.ReadFile(filepath.Join(dir, "stdin"))
+	dec = json.NewDecoder(bytes.NewReader(b))
+	for dec.Decode(&files) == nil && files[reed.ActStorage] == "" {
+	}
+	if strings.Contains(string(log), "c00kie") || !strings.Contains(files[reed.ActStorage], "c00kie-77") || !strings.Contains(files[reed.ActConfig], `"storageState":"`+reed.ActStorage+`"`) ||
+		!strings.Contains(files[reed.ActConfig], `"secrets":{`) || files[reed.ActProfile] == "" || !strings.HasPrefix(reed.ActStorage, reed.ActHoldDir+"/") {
+		t.Errorf("files written for a sign-in: %v", files)
+	}
 }
 
 // TestInv_PersonInputIsOnlyKeysAndClicks: what a person's driving can
