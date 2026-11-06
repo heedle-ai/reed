@@ -282,7 +282,7 @@ const HoldJS = `exports.default = async ({ page }) => {
   const context = page.context();
   let hold = context.__heedleHold;
   if (!hold) {
-    hold = context.__heedleHold = { open: 0, person: 0, held: [], heldTotal: 0, byYou: [], byYouTotal: 0, profile: [] };
+    hold = context.__heedleHold = { open: 0, person: 0, held: [], heldTotal: 0, byYou: [], byYouTotal: 0, profile: [], typed: [] };
     try { hold.profile = JSON.parse(fs.readFileSync(` + "`" + ActProfile + "`" + `, "utf8")); } catch {}
     const freely = fs.existsSync(` + "`" + ActSendFreely + "`" + `);
     // A person's input (ClickJS, KeyJS) opens the way for PersonWindow
@@ -372,13 +372,15 @@ var personInput = fmt.Sprintf(`const h = page.context().__heedleHold; if (!h) th
 // and every password field, in every frame and open shadow root, so pirn
 // can hide them, in memory only, however they were typed (review 52: a
 // typo fixed with an arrow key split what was typed).
-const TypedJS = `async (page) => {
+var TypedJS = strings.Replace(typedJS, "MAX", strconv.Itoa(MaxTypedValue), 1)
+
+const typedJS = `async (page) => {
   const values = [];
   for (const f of page.frames()) {
     const vs = await f.evaluate(() => {
       const out = [];
       const walk = (root) => {
-        for (const e of root.querySelectorAll("[data-heedle-typed], input[type=password i]")) if (typeof e.value === "string" && e.value) out.push(e.value.slice(0, 1024));
+        for (const e of root.querySelectorAll("[data-heedle-typed], input[type=password i]")) { const v = e.isContentEditable ? e.textContent : e.value; if (typeof v === "string" && v) out.push(v.slice(0, MAX)); }
         for (const e of root.querySelectorAll("*")) if (e.shadowRoot) walk(e.shadowRoot);
       };
       walk(document);
@@ -386,6 +388,8 @@ const TypedJS = `async (page) => {
     }).catch(() => []);
     for (const v of vs) if (values.length < 200) values.push(v);
   }
+  const h = page.context().__heedleHold;
+  if (h) for (const v of values) if (v.length >= 4 && !h.typed.includes(v) && h.typed.length < 200) h.typed.push(v);
   return { values };
 }`
 
@@ -404,26 +408,43 @@ func IsKey(key string) bool {
 	return n == len(key) && n > 0 && r != utf8.RuneError && unicode.IsPrint(r)
 }
 
-// markTyped marks the field a person is typing into, in whichever frame
-// has the focus, so every later frame masks it (ShotJSFor), and is its
-// value (at most 1024 characters), or null.
-const markTyped = `(async () => { for (const f of page.frames()) { const v = await f.evaluate(() => { if (!document.hasFocus()) return null; let a = document.activeElement; while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement; if (!a || a === document.body || a === document.documentElement) return null; a.setAttribute("data-heedle-typed", ""); return typeof a.value === "string" ? a.value.slice(0, 1024) : ""; }).catch(() => null); if (v !== null) return v; } return null; })()`
+// personField defines, in a person's input's script, field(mark): the
+// focused field, in whichever frame or open shadow root has the focus
+// (never a frame's <iframe> element: the field inside it), marked as
+// typed into if mark, and its value (a contenteditable's text, at most
+// MaxTypedValue characters) if it is marked, "" if not, or null with no
+// field focused; and keep(v), which adds v, if at least four characters,
+// to what every frame masks as text too (hold.typed; review 52: a page
+// echoing what was typed showed it in frames).
+var personField = fmt.Sprintf(`const field = async (mark) => { for (const f of page.frames()) { const v = await f.evaluate((mark) => { if (!document.hasFocus()) return null; let a = document.activeElement; while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement; if (!a || a === document.body || a === document.documentElement || a.tagName === "IFRAME" || a.tagName === "FRAME") return null; if (mark) a.setAttribute("data-heedle-typed", ""); if (!a.hasAttribute("data-heedle-typed")) return ""; const v = a.isContentEditable ? a.textContent : a.value; return typeof v === "string" ? v.slice(0, %[1]d) : ""; }, mark).catch(() => null); if (v !== null) return v; } return null; }; const keep = (v) => { const h = page.context().__heedleHold; if (h && typeof v === "string" && v.length >= 4 && !h.typed.includes(v) && h.typed.length < 200) h.typed.push(v); };`, MaxTypedValue)
+
+// MaxTypedValue is the most of a field's value read as typed; a longer
+// value is hidden by its first MaxTypedValue characters.
+const MaxTypedValue = 4096
 
 // ClickJS is a person's click at (x, y) on the page, in CSS pixels of the
 // viewport, as DevTools input events (Playwright's mouse) (roadmap 9.10).
+// A click may send, so it opens the way for PersonWindow; the field it
+// leaves is kept to mask.
 func ClickJS(x, y int) (string, error) {
 	if x < 0 || y < 0 || x >= Width || y >= Height {
 		return "", fmt.Errorf("%w: a click at %d,%d is off the page", ErrInvalid, x, y)
 	}
-	return fmt.Sprintf("async (page) => { %s await page.mouse.click(%d, %d); return \"clicked\"; }", personInput, x, y), nil
+	return fmt.Sprintf("async (page) => { %s %s keep(await field(false)); await page.mouse.click(%d, %d); return \"clicked\"; }", personInput, personField, x, y), nil
 }
 
 // KeyJS is a person's key press (IsKey) as DevTools input events
-// (Playwright's keyboard): a named key is pressed, a character typed, and
-// the field it goes to is marked to be masked in every later frame. It
-// answers {before, after}: the focused field's value before and after the
-// key, so pirn can hide what a field holds however it was typed (review
-// 52: a typo fixed with an arrow key split what was typed).
+// (Playwright's keyboard): a named key is pressed, a character typed. A
+// key that edits (a character, Backspace, Delete) marks the field it goes
+// to, before and after the key (a code box that moves on by itself stays
+// marked), so every later frame masks it; another key marks nothing, so
+// tabbing through fields the agent filled hides none of them. It answers
+// {before, after}: the focused field's value before and after the key if
+// it is one typed into, so pirn hides what a field holds however it was
+// typed (review 52: a typo fixed with an arrow key split what was typed).
+// Only Enter and Space, which may send, open the way for PersonWindow
+// (review 52: every keystroke opened it, so a page sending on each key
+// passed as you).
 func KeyJS(key string) (string, error) {
 	if !IsKey(key) {
 		return "", fmt.Errorf("%w: not a key a person may press here", ErrInvalid)
@@ -433,10 +454,19 @@ func KeyJS(key string) (string, error) {
 	if keys[key] {
 		do = "await page.keyboard.press(" + k + ");"
 	}
-	// The field is marked before the key too, so a key that moves focus
-	// (a code box that moves on by itself) leaves its field marked
-	// (review 52).
-	return "async (page) => { " + personInput + " const before = await " + markTyped + "; " + do + " const after = await " + markTyped + "; return { before, after }; }", nil
+	open := `const h = page.context().__heedleHold; if (!h) throw new Error("no hold");`
+	if key == "Enter" || key == " " {
+		open = personInput
+	}
+	edits := !keys[key] || key == "Backspace" || key == "Delete"
+	mark, leave := "false", ""
+	if edits {
+		mark = "true"
+	}
+	if key == "Tab" || key == "Shift+Tab" || key == "Enter" || key == "Escape" {
+		leave = "keep(before);"
+	}
+	return "async (page) => { " + open + " " + personField + " const before = await field(" + mark + "); " + leave + " " + do + " const after = await field(" + mark + "); return { before, after }; }", nil
 }
 
 // ShotJSFor's script, run by Playwright MCP's browser_run_code_unsafe, is
@@ -450,8 +480,11 @@ func KeyJS(key string) (string, error) {
 // while driving (KeyJS marks them), are masked in every frame too
 // (roadmap 9.10). pirn takes every act frame with it.
 const shotJS = `async (page) => {
-  const vals = (page.context().__heedleHold || {}).profile || [];
-  if (vals.length !== WANT) throw new Error("the details to mask aren't loaded");
+  const hold = page.context().__heedleHold || {};
+  const details = hold.profile || [];
+  if (details.length !== WANT) throw new Error("the details to mask aren't loaded");
+  // What a person typed while driving is masked as text too (review 52).
+  const vals = details.concat((hold.typed || []).filter((v) => v.length >= 4));
   const mask = [];
   // Password fields, and fields a person typed into while driving, are
   // masked in every frame, whatever the step uses (roadmap 9.10).
