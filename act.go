@@ -824,6 +824,8 @@ func ShotOf(answer string) ([]byte, error) {
 	if len(a.Rects) > MaxMaskRects {
 		return nil, fmt.Errorf("%w: %d boxes to mask", ErrInvalid, len(a.Rects))
 	}
+	// (With no box to paint, the screenshot is checked as an image below
+	// and given back as it is.)
 	shot, err := stdbase64.StdEncoding.DecodeString(a.Image)
 	if err != nil || len(shot) > MaxScreenshot {
 		return nil, fmt.Errorf("%w: not a screenshot", ErrInvalid)
@@ -835,6 +837,9 @@ func ShotOf(answer string) ([]byte, error) {
 	src, _, err := image.Decode(bytes.NewReader(shot))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	if len(a.Rects) == 0 {
+		return shot, nil
 	}
 	img := image.NewRGBA(src.Bounds())
 	draw.Draw(img, img.Bounds(), src, src.Bounds().Min, draw.Src)
