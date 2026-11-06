@@ -399,3 +399,84 @@ func result(t *testing.T, out string) string {
 	}
 	return s
 }
+
+// TestContainer_ActPersonDrives: a person can take the wheel of an act
+// session (roadmap 9.10). Their clicks and keys reach the page as input
+// events (ClickJS, KeyJS); while they drive (PersonJS) what they send goes
+// through, counted as sent by them (PersonDoneJS); once they hand back, the
+// hold is on again. Every frame masks the password field and each field
+// they typed into, and only those.
+func TestContainer_ActPersonDrives(t *testing.T) {
+	img := testActBrowser(t)
+	network, check, _ := courseSites(t)
+	s, err := reed.Browser{Image: img, Network: network}.Start(ctx, reed.Visit{URL: "http://forms-srv:8080/password/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	cs := mcpSession(t, s)
+	run := func(code string, err error) string {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, isErr := call(t, cs, "browser_run_code_unsafe", map[string]any{"code": code})
+		if isErr {
+			t.Fatalf("%.200s: %s", code, out)
+		}
+		return out
+	}
+	call(t, cs, "browser_navigate", map[string]any{"url": "http://forms-srv:8080/password/"})
+	boxes := run(`async (page) => JSON.stringify(await Promise.all(["Email", "Password", "New delivery address"].map((l) => page.getByLabel(l).boundingBox())))`, nil)
+	var rects []struct{ X, Y, Width, Height float64 }
+	if json.Unmarshal([]byte(result(t, boxes)), &rects) != nil || len(rects) != 3 {
+		t.Fatalf("boxes: %s", boxes)
+	}
+	run(reed.PersonJS, nil)
+	run(reed.ClickJS(int(rects[0].X+5), int(rects[0].Y+5)))
+	for _, k := range strings.Split("ada@example.org", "") {
+		run(reed.KeyJS(k))
+	}
+	run(reed.KeyJS("Tab"))
+	for _, k := range strings.Split("hunter2", "") {
+		run(reed.KeyJS(k))
+	}
+	// The frame: the field typed into and the password field masked, the
+	// one left alone not.
+	pic, err := jpeg.Decode(base64.NewDecoder(base64.StdEncoding, strings.NewReader(result(t, run(reed.ShotJSFor(0), nil)))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	masked := func(r struct{ X, Y, Width, Height float64 }) float64 {
+		in, all := 0, 0
+		for y := int(r.Y) + 2; y < int(r.Y+r.Height)-2; y++ {
+			for x := int(r.X) + 2; x < int(r.X+r.Width)-2; x++ {
+				c := color.RGBAModel.Convert(pic.At(x, y)).(color.RGBA)
+				all++
+				if near(c.R, 0x5b) && near(c.G, 0x5f) && near(c.B, 0x6b) {
+					in++
+				}
+			}
+		}
+		return float64(in) / float64(max(all, 1))
+	}
+	if e, p, a := masked(rects[0]), masked(rects[1]), masked(rects[2]); e < 0.9 || p < 0.9 || a > 0.2 {
+		t.Errorf("masked: typed %.2f, password %.2f, untouched %.2f", e, p, a)
+	}
+	run(reed.KeyJS("Enter")) // the person sends it: theirs
+	time.Sleep(time.Second)
+	done := run(reed.PersonDoneJS, nil)
+	if got := check("password").Received; len(got) != 1 || !strings.Contains(got[0], "email=ada%40example.org") || !strings.Contains(done, "POST http://forms-srv:8080/password/submit") {
+		t.Errorf("sent by the person: received %v, %s", got, done)
+	}
+	// Handed back: the hold is on again.
+	call(t, cs, "browser_navigate", map[string]any{"url": "http://forms-srv:8080/password/"})
+	snap, _ := call(t, cs, "browser_snapshot", nil)
+	call(t, cs, "browser_click", map[string]any{"element": "Sign in", "target": ref(t, snap, `button "Sign in and save"`)})
+	if got := check("password").Received; len(got) != 1 {
+		t.Errorf("sent after the person handed back: %v", got)
+	}
+	if _, err := reed.ClickJS(reed.Width, 0); err == nil {
+		t.Error("a click off the page")
+	}
+}

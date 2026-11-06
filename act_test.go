@@ -398,3 +398,41 @@ func TestInv_ProfileGoesOnStandardInput(t *testing.T) {
 		t.Errorf("files written: %s", b)
 	}
 }
+
+// TestInv_PersonInputIsOnlyKeysAndClicks: what a person's driving can
+// send the browser is a click on the page or one key: a named key, or one
+// printable character, which reaches the page's script only as a string
+// literal; anything else is refused (roadmap 9.10).
+func TestInv_PersonInputIsOnlyKeysAndClicks(t *testing.T) {
+	for _, k := range []string{"a", "Z", "é", "@", "+", " ", "\"", "Enter", "Tab", "Shift+Tab", "Backspace", "ArrowLeft"} {
+		js, err := reed.KeyJS(k)
+		if err != nil || !reed.IsKey(k) {
+			t.Errorf("%q refused: %v", k, err)
+		}
+		lit, _ := json.Marshal(k)
+		if !strings.Contains(js, "("+string(lit)+")") {
+			t.Errorf("%q not a literal: %s", k, js)
+		}
+	}
+	for _, k := range []string{"", "ab", "Control+a", "Meta+v", "\n", "\t", "\x00", "a\");fetch(\"x", "enter"} {
+		if _, err := reed.KeyJS(k); !errors.Is(err, reed.ErrInvalid) || reed.IsKey(k) {
+			t.Errorf("%q accepted", k)
+		}
+	}
+	if js, err := reed.ClickJS(10, 20); err != nil || !strings.Contains(js, "page.mouse.click(10, 20)") {
+		t.Errorf("%s %v", js, err)
+	}
+	for _, xy := range [][2]int{{-1, 0}, {0, -1}, {reed.Width, 0}, {0, reed.Height}} {
+		if _, err := reed.ClickJS(xy[0], xy[1]); !errors.Is(err, reed.ErrInvalid) {
+			t.Errorf("%v accepted", xy)
+		}
+	}
+	for _, js := range []string{reed.PersonJS, reed.PersonDoneJS} {
+		if !strings.Contains(js, "__heedleHold") {
+			t.Errorf("not the hold's: %s", js)
+		}
+	}
+	if !strings.Contains(reed.HoldJS, "hold.person") || !strings.Contains(reed.ShotJSFor(0), `input[type="password" i], [data-heedle-typed]`) {
+		t.Error("the hold or the mask doesn't know the person")
+	}
+}
