@@ -408,63 +408,93 @@ const typedJS = `
 // of the page, never the page's own world, so a page that replaces its
 // String, RegExp or Array methods, or a field's value getter, sees and
 // changes nothing (review 52). Frames in a process of their own (another
-// site's) are reached through their own DevTools session. It answers each
-// frame's value (by value), or, with rects, the boxes, in the page's
-// viewport, of the elements fn answers, and each frame's document
-// (frame and loader IDs), so a page that loads another document in
-// between can be told. Sessions and worlds are kept on the browser
-// context, which only Playwright's own process reaches, and a world is
-// made again when its document changes.
+// site's) are reached through their own DevTools session, their place on
+// the page (offset and scale) read by DevTools from the <iframe> that
+// holds them. It answers each frame's value (by value), or, with rects,
+// the boxes, in the page's viewport, of the nodes fn answers, and each
+// frame's document (frame and loader IDs), so a page that loads another
+// document in between can be told. It fails rather than skip a frame:
+// every frame of the page must be reached. Sessions and worlds are kept
+// on the browser context, which only Playwright's own process reaches; on
+// any failure (a frame moved to another process, say) they are all made
+// again, once (review 52).
 const worldsJS = `const inWorlds = async (page, fn, arg, rects) => {
   const ctx = page.context();
-  const cache = ctx.__heedleWorlds || (ctx.__heedleWorlds = { sessions: new WeakMap(), worlds: new Map() });
-  const session = async (target) => { let s = cache.sessions.get(target); if (!s) { s = await ctx.newCDPSession(target); cache.sessions.set(target, s); } return s; };
-  const targets = [{ s: await session(page), off: [0, 0] }];
-  for (const f of page.frames()) {
-    if (f === page.mainFrame()) continue;
-    let s;
-    try { s = await session(f); } catch { continue; }
-    let off = null;
-    const fe = await f.frameElement().catch(() => null);
-    const box = fe && await fe.boundingBox();
-    if (box) { const pad = await fe.evaluate((e) => { const c = getComputedStyle(e); return [e.clientLeft + parseFloat(c.paddingLeft), e.clientTop + parseFloat(c.paddingTop)]; }); off = [box.x + pad[0], box.y + pad[1]]; }
-    targets.push({ s, off, own: true });
-  }
-  for (const t of targets) t.tree = (await t.s.send("Page.getFrameTree")).frameTree;
-  const roots = new Set(targets.filter((t) => t.own).map((t) => t.tree.frame.id));
-  const out = { values: [], rects: [], docs: [] };
-  for (const t of targets) {
-    const frames = [], todo = [t.tree];
-    while (todo.length) { const n = todo.pop(); if (n !== t.tree && roots.has(n.frame.id)) continue; frames.push(n.frame); todo.push(...(n.childFrames || [])); }
-    for (const fr of frames) {
-      const key = fr.id + "/" + fr.loaderId;
-      out.docs.push(key);
-      let r = null;
-      for (let attempt = 0; !r; attempt++) {
+  const attempt = async () => {
+    const cache = ctx.__heedleWorlds || (ctx.__heedleWorlds = { sessions: new Map(), worlds: new Map() });
+    for (const f of cache.sessions.keys()) if (f !== page && f.isDetached && f.isDetached()) cache.sessions.delete(f);
+    const session = async (target) => { let s = cache.sessions.get(target); if (!s) { s = await ctx.newCDPSession(target); cache.sessions.set(target, s); } return s; };
+    const main = { f: page.mainFrame(), s: await session(page), map: [0, 0, 1, 1] };
+    const targets = [main], own = new Map([[page.mainFrame(), main]]);
+    for (const f of page.frames()) {
+      if (f === page.mainFrame()) continue;
+      let s = cache.sessions.get(f);
+      if (!s) {
+        try { s = await ctx.newCDPSession(f); } catch (e) { if (/separate CDP session/.test(String(e))) continue; throw e; }
+        cache.sessions.set(f, s);
+      }
+      const t = { f, s, own: true };
+      targets.push(t); own.set(f, t);
+    }
+    for (const t of targets) t.tree = (await t.s.send("Page.getFrameTree")).frameTree;
+    const holder = (f) => { for (let p = f; p; p = p.parentFrame()) if (own.has(p)) return own.get(p); return main; };
+    if (rects) for (const t of targets) {
+      if (t === main) continue;
+      const pt = holder(t.f.parentFrame());
+      t.map = null;
+      if (!pt.map) continue; // inside a frame not shown
+      let box = null;
+      try {
+        const { backendNodeId } = await pt.s.send("DOM.getFrameOwner", { frameId: t.tree.frame.id });
+        box = (await pt.s.send("DOM.getBoxModel", { backendNodeId })).model;
+      } catch (e) { if (!/box model/i.test(String(e))) throw e; } // not rendered: nothing of it shows
+      if (!box) continue;
+      const { cssLayoutViewport: v } = await t.s.send("Page.getLayoutMetrics");
+      const q = box.content, xs = [q[0], q[2], q[4], q[6]], ys = [q[1], q[3], q[5], q[7]];
+      const x0 = Math.min(...xs), y0 = Math.min(...ys), m = pt.map;
+      t.map = [m[0] + x0 * m[2], m[1] + y0 * m[3], m[2] * (Math.max(...xs) - x0) / (v.clientWidth || 1), m[3] * (Math.max(...ys) - y0) / (v.clientHeight || 1)];
+    }
+    const roots = new Set(targets.filter((t) => t !== main).map((t) => t.tree.frame.id));
+    const out = { values: [], rects: [], docs: [] };
+    let reached = 0;
+    for (const t of targets) {
+      const frames = [], todo = [t.tree];
+      while (todo.length) { const n = todo.pop(); if (n !== t.tree && roots.has(n.frame.id)) continue; frames.push(n.frame); todo.push(...(n.childFrames || [])); }
+      reached += frames.length;
+      for (const fr of frames) {
+        const key = fr.id + "/" + fr.loaderId;
+        out.docs.push(key);
         let id = cache.worlds.get(key);
         if (!id) { id = (await t.s.send("Page.createIsolatedWorld", { frameId: fr.id, worldName: "heedle" })).executionContextId; cache.worlds.set(key, id); }
-        try { r = await t.s.send("Runtime.callFunctionOn", { functionDeclaration: fn, executionContextId: id, arguments: [{ value: arg }], returnByValue: !rects, objectGroup: "heedle" }); }
-        catch (e) { cache.worlds.delete(key); if (attempt) throw e; }
-      }
-      if (r.exceptionDetails) throw new Error("a frame couldn't be read");
-      if (!rects) { out.values.push(r.result.value); continue; }
-      if (t.off) {
-        const { result } = await t.s.send("Runtime.getProperties", { objectId: r.result.objectId, ownProperties: true });
-        for (const p of result) {
-          if (!p.value || p.value.subtype !== "node") continue;
-          let q;
-          try { q = await t.s.send("DOM.getContentQuads", { objectId: p.value.objectId }); } catch { continue; } // not rendered
-          for (const d of q.quads) {
-            const xs = [d[0], d[2], d[4], d[6]], ys = [d[1], d[3], d[5], d[7]];
-            out.rects.push([Math.min(...xs) + t.off[0], Math.min(...ys) + t.off[1], Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)]);
+        const r = await t.s.send("Runtime.callFunctionOn", { functionDeclaration: fn, executionContextId: id, arguments: [{ value: arg }], returnByValue: !rects, objectGroup: "heedle" });
+        if (r.exceptionDetails) throw new Error("a frame couldn't be read");
+        if (!rects) { out.values.push(r.result.value); continue; }
+        if (t.map) {
+          const m = t.map;
+          const { result } = await t.s.send("Runtime.getProperties", { objectId: r.result.objectId, ownProperties: true });
+          for (const p of result) {
+            if (!p.value || p.value.subtype !== "node") continue;
+            let q;
+            try { q = await t.s.send("DOM.getContentQuads", { objectId: p.value.objectId }); } catch { continue; } // not rendered
+            for (const d of q.quads) {
+              const xs = [d[0], d[2], d[4], d[6]], ys = [d[1], d[3], d[5], d[7]];
+              out.rects.push([m[0] + Math.min(...xs) * m[2], m[1] + Math.min(...ys) * m[3], (Math.max(...xs) - Math.min(...xs)) * m[2], (Math.max(...ys) - Math.min(...ys)) * m[3]]);
+            }
           }
         }
+        await t.s.send("Runtime.releaseObjectGroup", { objectGroup: "heedle" }).catch(() => {});
       }
-      await t.s.send("Runtime.releaseObjectGroup", { objectGroup: "heedle" }).catch(() => {});
     }
+    if (reached !== page.frames().length) throw new Error("not every frame could be reached");
+    if (cache.worlds.size > 500) cache.worlds.clear();
+    return out;
+  };
+  try { return await attempt(); } catch {
+    const old = ctx.__heedleWorlds;
+    ctx.__heedleWorlds = null;
+    if (old) for (const s of old.sessions.values()) s.detach().catch(() => {});
+    return await attempt();
   }
-  if (cache.worlds.size > 500) cache.worlds.clear();
-  return out;
 };`
 
 // keys are the named keys a person may press while driving; any other
@@ -563,15 +593,15 @@ func KeyJS(key string) (string, error) {
 // marks them) masked by Playwright's own screenshot mask, and the boxes of
 // every field holding one of the person's details the step may use or
 // what they typed (hold.typed), and of every smallest element whose text
-// shows one, in every frame, for ShotOf to paint over (roadmap 9.8,
-// 9.10). A value is matched by its letters and digits, so one the page
+// shows one and its text nodes, in every frame, for ShotOf to paint over
+// (roadmap 9.8, 9.10). A value is matched by its letters and digits, so one the page
 // reformats, spaces out or uppercases is masked too. The matching runs in
 // an isolated world of each frame (worldsJS), never the page's, and writes
 // nothing to the page: no attribute tells the page which of its elements
 // hold a value (review 52: a page could plant candidates and read which
-// were marked). The boxes are read before and after the screenshot and
-// both are painted; if any frame's document changed in between, there is
-// no frame at all, never an unmasked one. A page can deny frames so (a
+// were marked). The boxes are read before and after the screenshot; if
+// any frame's document changed in between, or any box moved, there is no
+// frame at all, never an unmasked one. A page can deny frames so (a
 // document reloading without end, or text too large to match), never get
 // an unmasked one. pirn takes every act frame with it.
 const shotJS = `async (page) => {
@@ -599,7 +629,13 @@ const shotJS = `async (page) => {
         if (el.shadowRoot) roots.push(el.shadowRoot);
         const field = el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable;
         if (field && has("value" in el ? el.value : el.textContent)) out.push(el);
-        else if (shows.has(el) && ![...el.children].some((c) => shows.has(c))) out.push(el);
+        else if (shows.has(el) && ![...el.children].some((c) => shows.has(c))) {
+          // The element, and its text itself, which may spill out of it
+          // (review 52).
+          out.push(el);
+          const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+          for (let n = w.nextNode(); n; n = w.nextNode()) out.push(n);
+        }
       }
     }
     return out;
@@ -607,8 +643,11 @@ const shotJS = `async (page) => {
   const before = ns.length ? await inWorlds(page, marks, ns, true) : null;
   const b = await page.screenshot({ type: "jpeg", quality: 90, scale: "css", mask, maskColor: "#5b5f6b", animations: "disabled", timeout: 10000 });
   const after = ns.length ? await inWorlds(page, marks, ns, true) : null;
-  if (before && before.docs.slice().sort().join(" ") !== after.docs.slice().sort().join(" ")) throw new Error("the page changed while its frame was taken");
-  return { image: b.toString("base64"), rects: before ? before.rects.concat(after.rects) : [] };
+  // A document loaded, or anything that matched moved, between the two
+  // readings: no frame (review 52).
+  const same = (x, y) => x.docs.slice().sort().join(" ") === y.docs.slice().sort().join(" ") && JSON.stringify(x.rects.map((r) => r.map(Math.round))) === JSON.stringify(y.rects.map((r) => r.map(Math.round)));
+  if (before && !same(before, after)) throw new Error("the page changed while its frame was taken");
+  return { image: b.toString("base64"), rects: before ? before.rects : [] };
 }`
 
 // ShotJSFor is ShotJS for a session given n details: it fails, rather
