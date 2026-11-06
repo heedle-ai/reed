@@ -430,7 +430,7 @@ func TestInv_ProfileGoesOnStandardInput(t *testing.T) {
 	if err := s.DropStorage(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if log, _ = os.ReadFile(filepath.Join(dir, "log")); !strings.Contains(string(log), "rmSync") || !strings.Contains(string(log), reed.ActStorage) {
+	if log, _ = os.ReadFile(filepath.Join(dir, "log")); !strings.Contains(string(log), "rmSync") || !strings.Contains(string(log), reed.ActStorage) || !strings.Contains(string(log), reed.ActSignedIn) {
 		t.Errorf("the sign-in's file wasn't removed:\n%s", log)
 	}
 }

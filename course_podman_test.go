@@ -971,11 +971,13 @@ func TestContainer_ActStartsSignedIn(t *testing.T) {
 	if err := s.DropStorage(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("podman", "exec", s.Name(), reed.ActNode, "-e", "console.log(require('fs').readdirSync(process.argv[1]).join(' '))", reed.ActHoldDir).CombinedOutput(); err != nil || strings.Contains(string(out), "storage.json") {
-		t.Errorf("the sign-in's file is still there: %v %s", err, out)
+	if out, err := exec.Command("podman", "exec", s.Name(), reed.ActNode, "-e", "console.log(require('fs').readdirSync(process.argv[1]).join(' '))", reed.ActHoldDir).CombinedOutput(); err != nil || strings.Contains(string(out), "storage.json") || strings.Contains(string(out), "signed-in.json") {
+		t.Errorf("the sign-in's files are still there: %v %s", err, out)
 	}
-	if out, _ := call(t, cs, "browser_navigate", map[string]any{"url": "file://" + reed.ActStorage}); strings.Contains(out, "member-") {
-		t.Errorf("the browser read the sign-in's file: %.300s", out)
+	for _, f := range []string{reed.ActStorage, reed.ActSignedIn} {
+		if out, _ := call(t, cs, "browser_navigate", map[string]any{"url": "file://" + f}); strings.Contains(out, "member-") {
+			t.Errorf("the browser read %s: %.300s", f, out)
+		}
 	}
 	call(t, cs, "browser_navigate", map[string]any{"url": "http://forms-srv:8080/whoami/password"})
 	if snap, _ := call(t, cs, "browser_snapshot", nil); !strings.Contains(snap, "Signed in as a course member") {
@@ -996,5 +998,38 @@ func TestContainer_ActStartsSignedIn(t *testing.T) {
 	}
 	if got := check("contact").Received; len(got) != 0 {
 		t.Errorf("received: %v", got)
+	}
+	// The page going to a host not signed in, with no query, is held too
+	// (review 53, round 2).
+	held = heldTotal()
+	call(t, cs, "browser_navigate", map[string]any{"url": "http://other-srv:8080/contact/member-t0ken"})
+	if n := heldTotal(); n != held+1 {
+		t.Errorf("going to a host not signed in: held %d then %d", held, n)
+	}
+	// A page showing what the sign-in holds is masked in frames, and what
+	// a person typed (TypedJS) isn't mistaken for it (review 53, round 2).
+	call(t, cs, "browser_navigate", map[string]any{"url": "http://forms-srv:8080/whoami/password"})
+	box := run(`async (page) => { await page.evaluate(() => { const p = document.createElement("p"); p.style.font = "28px sans-serif"; p.textContent = "Your token: member-t0ken"; document.body.prepend(p); }); return JSON.stringify(await page.getByText("Your token").boundingBox()); }`)
+	var r struct{ X, Y, Width, Height float64 }
+	json.Unmarshal([]byte(result(t, box)), &r)
+	pic, err := shotOf(run(reed.ShotJSFor(0)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, all := 0, 0
+	for y := int(r.Y) + 2; y < int(r.Y+r.Height)-2; y++ {
+		for x := int(r.X) + 2; x < int(r.X+r.Width)-2; x++ {
+			c := color.RGBAModel.Convert(pic.At(x, y)).(color.RGBA)
+			all++
+			if near(c.R, 0x5b) && near(c.G, 0x5f) && near(c.B, 0x6b) {
+				in++
+			}
+		}
+	}
+	if m := float64(in) / float64(max(all, 1)); m < 0.9 {
+		t.Errorf("the sign-in's value shown on the page: masked %.2f", m)
+	}
+	if typed := run(reed.TypedJS); strings.Contains(typed, "member-") {
+		t.Errorf("what was typed holds the sign-in: %s", typed)
 	}
 }
