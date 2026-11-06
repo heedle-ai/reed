@@ -449,17 +449,25 @@ const inFocus = async (page, fn, arg) => {
     if (!s) { try { s = await ctx.newCDPSession(f); cache.sessions.set(f, s); } catch (e) { if (!/separate CDP session/.test(String(e))) failed = true; continue; } }
     targets.push({ s, f });
   }
+  const roots = new Set();
   for (const t of targets) {
-    let tree;
-    try { tree = (await t.s.send("Page.getFrameTree")).frameTree; } catch { failed = true; if (t.f) cache.sessions.delete(t.f); else cache.sessions.delete(page); continue; }
-    const todo = [tree];
+    try { t.tree = (await t.s.send("Page.getFrameTree")).frameTree; if (t.f) roots.add(t.tree.frame.id); } catch { failed = true; if (t.f) cache.sessions.delete(t.f); else cache.sessions.delete(page); }
+  }
+  let reached = 0;
+  for (const t of targets) {
+    if (!t.tree) continue;
+    const todo = [t.tree];
     while (todo.length) {
       const n = todo.pop();
+      if (n !== t.tree && roots.has(n.frame.id)) continue;
+      reached++;
       todo.push(...(n.childFrames || []));
       try { const v = (await heedleCall(ctx, t, n.frame, fn, arg, true)).value; if (v) return v; } catch { failed = true; cache.worlds.delete(n.frame.id + "/" + n.frame.loaderId); }
     }
   }
-  if (failed) throw new Error("the focused frame couldn't be read");
+  // A frame not reached (passed over as in the page's process, say) may
+  // be the focused one too.
+  if (failed || reached !== page.frames().length) throw new Error("the focused frame couldn't be read");
   return null;
 };
 const inWorlds = async (page, fn, arg, rects) => {
@@ -564,7 +572,7 @@ func IsKey(key string) bool {
 // now, to what every frame masks as text too (hold.typed; review 52: a
 // page echoing what was typed showed it in frames). Nothing typed is ever
 // passed into the page's own script.
-var personField = worldsJS + fmt.Sprintf(` const probe = ((mark) => { if (!document.hasFocus()) return null; let a = document.activeElement; while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement; if (!a || a === document.body || a === document.documentElement || a.tagName === "IFRAME" || a.tagName === "FRAME") return null; if (mark) a.setAttribute("data-heedle-typed", ""); const t = a.tagName === "INPUT" ? (a.getAttribute("type") || "text").toLowerCase() : ""; const area = a.tagName === "TEXTAREA" || a.isContentEditable; const text = area || (a.tagName === "INPUT" && !["button", "submit", "reset", "checkbox", "radio", "file", "image", "color", "range", "hidden"].includes(t)); const raw = a.isContentEditable ? a.textContent : a.value; return { v: a.hasAttribute("data-heedle-typed") && typeof raw === "string" ? raw.slice(0, %[1]d) : null, pw: t === "password", text, area }; }).toString(); const field = async (mark) => inFocus(page, probe, mark); const keep = (f) => { const h = page.context().__heedleHold; if (h && f && !f.pw && typeof f.v === "string" && f.v.length >= 4 && !h.typed.includes(f.v) && h.typed.length < 200) h.typed.push(f.v); };`, MaxTypedValue)
+var personField = worldsJS + fmt.Sprintf(` const probe = ((mark) => { if (!document.hasFocus()) return null; let a = document.activeElement; while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement; if (!a || a === document.body || a === document.documentElement || ["IFRAME", "FRAME", "OBJECT", "EMBED"].includes(a.tagName)) return null; if (mark) a.setAttribute("data-heedle-typed", ""); const t = a.tagName === "INPUT" ? (a.getAttribute("type") || "text").toLowerCase() : ""; const area = a.tagName === "TEXTAREA" || a.isContentEditable; const text = area || (a.tagName === "INPUT" && !["button", "submit", "reset", "checkbox", "radio", "file", "image", "color", "range", "hidden"].includes(t)); const raw = a.isContentEditable ? a.textContent : a.value; return { v: a.hasAttribute("data-heedle-typed") && typeof raw === "string" ? raw.slice(0, %[1]d) : null, pw: t === "password", text, area }; }).toString(); const field = async (mark) => inFocus(page, probe, mark); const keep = (f) => { const h = page.context().__heedleHold; if (h && f && !f.pw && typeof f.v === "string" && f.v.length >= 4 && !h.typed.includes(f.v) && h.typed.length < 200) h.typed.push(f.v); };`, MaxTypedValue)
 
 // MaxTypedValue is the most of a field's value read as typed; a longer
 // value is hidden by its first MaxTypedValue characters.
@@ -578,7 +586,10 @@ func ClickJS(x, y int) (string, error) {
 	if x < 0 || y < 0 || x >= Width || y >= Height {
 		return "", fmt.Errorf("%w: a click at %d,%d is off the page", ErrInvalid, x, y)
 	}
-	return fmt.Sprintf("async (page) => { %s %s keep(await field(false)); await page.mouse.click(%d, %d); return \"clicked\"; }", personInput, personField, x, y), nil
+	// The field it leaves is kept if it can be read; a click never waits on
+	// that (review 52: on a page whose frames come and go, the first click
+	// into a field was lost).
+	return fmt.Sprintf("async (page) => { %s %s keep(await field(false).catch(() => null)); await page.mouse.click(%d, %d); return \"clicked\"; }", personInput, personField, x, y), nil
 }
 
 // KeyJS is a person's key press (IsKey) as DevTools input events
@@ -623,8 +634,17 @@ func KeyJS(key string) (string, error) {
 	if key == "Tab" || key == "Shift+Tab" || key == "Enter" || key == "Escape" {
 		leave = "keep(before);"
 	}
-	return "async (page) => { if (!page.context().__heedleHold) throw new Error(\"no hold\"); " + personField + " let before = await field(false); const mark = " + mark + "; if (mark) before = await field(true); " + open + " " + leave + " " + do +
-		" const after = await field(mark); return { before: before && before.v, after: after && after.v }; }", nil
+	// A key that edits, Space or Enter must read its field before it is
+	// pressed (what it types is hidden, and whether it may send depends on
+	// the field); any other is pressed even if no frame can be read. After
+	// the key, which may have loaded another page, the field is read if it
+	// can be: the key went already (review 52).
+	read := "field"
+	if keys[key] && key != "Backspace" && key != "Delete" && key != "Enter" {
+		read = "((m) => field(m).catch(() => null))"
+	}
+	return "async (page) => { if (!page.context().__heedleHold) throw new Error(\"no hold\"); " + personField + " const read = " + read + "; let before = await read(false); const mark = " + mark + "; if (mark) before = await read(true); " + open + " " + leave + " " + do +
+		" const after = await field(mark).catch(() => null); return { before: before && before.v, after: after && after.v }; }", nil
 }
 
 // ShotJSFor's script, run by Playwright MCP's browser_run_code_unsafe,

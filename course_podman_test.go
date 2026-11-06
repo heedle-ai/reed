@@ -666,6 +666,19 @@ func TestContainer_ActPersonDrives(t *testing.T) {
 			t.Errorf("a send while typing %q: held %d then %d", keys, held, n)
 		}
 	}
+	// A form in an <object> or an <embed>: its field is read as in an
+	// iframe (review 52, round 8).
+	for _, tag := range []string{"object", "embed"} {
+		call(t, cs, "browser_navigate", map[string]any{"url": "http://forms-srv:8080/password/"})
+		run(`async (page) => { await page.evaluate((tag) => { const o = document.createElement(tag); o.type = "text/html"; o[tag === "object" ? "data" : "src"] = "/iframe/frame.html"; o.style.cssText = "width:400px;height:200px"; document.body.append(o); }, `+"`"+tag+"`"+`); await page.waitForTimeout(1000); const f = page.frames().find((f) => f.url().endsWith("/iframe/frame.html")); await f.locator("input[name=email]").focus(); return "focused"; }`, nil)
+		for _, k := range strings.Split("obj@example.org", "") {
+			run(reed.KeyJS(k))
+		}
+		if out := run(reed.KeyJS("End")); !strings.Contains(out, "obj@example.org") {
+			t.Errorf("a field in an <%s>: %s", tag, out)
+		}
+	}
+	call(t, cs, "browser_navigate", map[string]any{"url": "http://forms-srv:8080/password/"})
 	// Space on a button presses it, and marks nothing (review 52, round 4).
 	run(`async (page) => { await page.getByRole("button", { name: "Sign in and save" }).focus(); return "focused"; }`, nil)
 	if out := run(reed.KeyJS(" ")); !strings.Contains(out, `"before": null`) && !strings.Contains(out, `"before":null`) {
@@ -840,7 +853,20 @@ func TestContainer_ActMasksAcrossSites(t *testing.T) {
 	// Frames coming and going every 100 ms: every key the person types
 	// arrives and is read (review 52, round 6).
 	run(`async (page) => { await page.evaluate(() => { setInterval(() => { const i = document.createElement("iframe"); i.src = "http://other-srv:8080/iframe/frame.html"; i.style.width = "10px"; document.body.append(i); setTimeout(() => i.remove(), 100); }, 100); }); return "churning"; }`, nil)
-	run(reed.ClickJS(int(r.X+5), int(r.Y+5)))
+	// Nothing focused: keys that don't edit, and the first click into
+	// the field, still arrive (review 52, round 7).
+	run(`async (page) => { for (const f of page.frames()) await f.evaluate(() => document.activeElement && document.activeElement.blur()).catch(() => {}); return "blurred"; }`, nil)
+	for _, k := range []string{"PageDown", "Escape", "Tab", "Shift+Tab"} {
+		if out, isErr := call(t, cs, "browser_run_code_unsafe", map[string]any{"code": mustKey(t, k)}); isErr {
+			t.Errorf("%s with nothing focused, frames coming and going: %.300s", k, out)
+		}
+	}
+	run(`async (page) => { for (const f of page.frames()) await f.evaluate(() => document.activeElement && document.activeElement.blur()).catch(() => {}); return "blurred"; }`, nil)
+	for range 5 {
+		if out, isErr := call(t, cs, "browser_run_code_unsafe", map[string]any{"code": mustClick(t, int(r.X+5), int(r.Y+5))}); isErr {
+			t.Fatalf("a click into the field, frames coming and going: %.300s", out)
+		}
+	}
 	run(`async (page) => { const f = page.frames().find((f) => f.url().startsWith("http://forms-srv:8080/iframe/frame")); await f.locator("input[name=email]").fill(""); return "cleared"; }`, nil)
 	for _, k := range strings.Split("churn@example.org", "") {
 		if out, isErr := call(t, cs, "browser_run_code_unsafe", map[string]any{"code": mustKey(t, k)}); isErr {
@@ -862,6 +888,16 @@ func TestContainer_ActMasksAcrossSites(t *testing.T) {
 			t.Fatalf("held: %s", out)
 		}
 		return h.Total
+	}
+	// Focus in the other site's frame, which can't be reached (passed over
+	// as in the page's process): a key that edits isn't pressed (review 52,
+	// round 8).
+	run(`async (page) => { const f = page.frames().find((f) => f.url().startsWith("http://other-srv")); await f.locator("input[name=email]").fill(""); await f.locator("input[name=email]").focus(); const ctx = page.context(); ctx.__heedleWorlds = null; ctx.__heedleOrig = ctx.__heedleOrig || ctx.newCDPSession.bind(ctx); ctx.newCDPSession = async (t) => { if (t !== page && t.url && t.url().startsWith("http://other-srv")) throw new Error("This frame does not have a separate CDP session"); return ctx.__heedleOrig(t); }; return "unreachable"; }`, nil)
+	if out, isErr := call(t, cs, "browser_run_code_unsafe", map[string]any{"code": mustKey(t, "a")}); !isErr {
+		t.Errorf("a key pressed in a frame that couldn't be read: %.200s", out)
+	}
+	if out := run(`async (page) => { const ctx = page.context(); ctx.newCDPSession = ctx.__heedleOrig; ctx.__heedleWorlds = null; return JSON.stringify(await page.frames().find((f) => f.url().startsWith("http://other-srv")).locator("input[name=email]").inputValue()); }`, nil); !strings.Contains(out, `\"\"`) {
+		t.Errorf("the key went in: %s", out)
 	}
 	held := heldTotal()
 	run(`async (page) => { const f = page.frames().find((f) => f.url().startsWith("http://other-srv")); await (await page.context().newCDPSession(f)).detach();
@@ -887,6 +923,16 @@ func shotOf(answer string) (image.Image, error) {
 func mustKey(t *testing.T, k string) string {
 	t.Helper()
 	js, err := reed.KeyJS(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return js
+}
+
+// mustClick is reed.ClickJS(x, y), which must be on the page.
+func mustClick(t *testing.T, x, y int) string {
+	t.Helper()
+	js, err := reed.ClickJS(x, y)
 	if err != nil {
 		t.Fatal(err)
 	}
