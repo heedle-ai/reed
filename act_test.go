@@ -3,9 +3,12 @@ package reed_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"image"
+	"image/color"
+	"image/draw"
 	"image/jpeg"
 	"image/png"
 	"net"
@@ -43,6 +46,9 @@ func TestInv_ActCommandLines(t *testing.T) {
 		if in := contains(launch, f); shared && !in {
 			t.Errorf("act's browser lacks browse's %s", f)
 		}
+	}
+	if !contains(launch, "--site-per-process") {
+		t.Error("act's browser doesn't keep each site's frames in a process of their own")
 	}
 	for _, f := range launch {
 		if strings.HasPrefix(f, "--remote-debugging") || strings.HasPrefix(f, "--user-data-dir") || f == "--headless" || !strings.HasPrefix(f, "--") {
@@ -439,5 +445,52 @@ func TestInv_PersonInputIsOnlyKeysAndClicks(t *testing.T) {
 	}
 	if !strings.Contains(reed.HoldJS, "hold.person") || !strings.Contains(reed.ShotJSFor(0), `input[type="password" i], [data-heedle-typed]`) {
 		t.Error("the hold or the mask doesn't know the person")
+	}
+}
+
+// TestInv_ShotOfPaintsEveryBox: ShotOf paints every box a ShotJSFor call
+// names over its screenshot, a little larger than the box, and nothing
+// else; an answer that isn't a screenshot with its boxes, or names too
+// many, is an error, never an unmasked image (review 52).
+func TestInv_ShotOfPaintsEveryBox(t *testing.T) {
+	src := image.NewRGBA(image.Rect(0, 0, 200, 100))
+	draw.Draw(src, src.Bounds(), image.White, image.Point{}, draw.Src)
+	var b bytes.Buffer
+	jpeg.Encode(&b, src, &jpeg.Options{Quality: 95})
+	answer := func(rects any) string {
+		j, _ := json.Marshal(map[string]any{"image": base64.StdEncoding.EncodeToString(b.Bytes()), "rects": rects})
+		return "### Result\n" + string(j) + "\n### Ran Playwright code\n"
+	}
+	out, err := reed.ShotOf(answer([][4]float64{{20, 20, 40, 10}, {150.5, 80, 10, 10}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pic, err := jpeg.Decode(bytes.NewReader(out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	grey := func(x, y int) bool {
+		c := color.RGBAModel.Convert(pic.At(x, y)).(color.RGBA)
+		return c.R > 0x50 && c.R < 0x66 && c.B > 0x60 && c.B < 0x76
+	}
+	for _, p := range [][2]int{{21, 21}, {59, 29}, {18, 24}, {155, 85}, {161, 91}} {
+		if !grey(p[0], p[1]) {
+			t.Errorf("%v isn't masked", p)
+		}
+	}
+	for _, p := range [][2]int{{5, 5}, {100, 50}, {70, 25}} {
+		if grey(p[0], p[1]) {
+			t.Errorf("%v is masked", p)
+		}
+	}
+	for name, bad := range map[string]string{
+		"no boxes":      strings.Replace(answer(nil), `"rects":null`, `"x":1`, 1),
+		"too many":      answer(make([][4]float64, reed.MaxMaskRects+1)),
+		"not an image":  "### Result\n{\"image\":\"aGVsbG8=\",\"rects\":[]}\n",
+		"a bare string": "### Result\n\"" + base64.StdEncoding.EncodeToString(b.Bytes()) + "\"\n",
+	} {
+		if _, err := reed.ShotOf(bad); err == nil {
+			t.Errorf("%s: no error", name)
+		}
 	}
 }
