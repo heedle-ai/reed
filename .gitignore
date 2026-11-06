@@ -1,2 +1,5 @@
 containers.log
 agent/node_modules/
+# conmon writes ./oom in podman's working folder when the kernel kills a
+# container's process for memory (a browser under its --memory limit).
+/oom
